@@ -67,6 +67,11 @@ impl Rng {
             return lo;
         }
         let span = (hi as u64).wrapping_sub(lo as u64).wrapping_add(1);
+        if span == 0 {
+            // Only (i64::MIN, i64::MAX) spans the full u64 range; the
+            // modulo below would divide by zero, so return raw bits.
+            return self.next_u64() as i64;
+        }
         (lo as i128 + (self.next_u64() as u128 % span as u128) as i128) as i64
     }
 
@@ -144,5 +149,15 @@ mod tests {
         for _ in 0..50 {
             assert_eq!(rng.pick_weighted(&table), "b");
         }
+    }
+
+    #[test]
+    fn full_i64_range_does_not_panic() {
+        // The whole i64 range wraps the u64 span to zero; the guard
+        // returns raw bits instead of dividing by zero.
+        let mut a = Rng::new(9);
+        let x = a.gen_range(i64::MIN, i64::MAX);
+        let mut b = Rng::new(9);
+        assert_eq!(x, b.gen_range(i64::MIN, i64::MAX));
     }
 }

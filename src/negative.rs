@@ -69,11 +69,18 @@ fn recur_cases() -> Vec<Case> {
 /// case content just costs more to build.
 pub const MAX_NEGATIVE_DEPTH: usize = 20_000;
 
+/// Depths at or above this claim StackOverflowError; below it the
+/// cases load cleanly and the manifest says so. Measured on a
+/// default-stack JVM: 1000 loads, 1500 overflows, both shapes. The
+/// real boundary is box-dependent (a huge -Xss moves it), so the
+/// default roll floors well above the claim line.
+pub const SOF_CLAIM_DEPTH: usize = 2000;
+
 fn nesting_cases(rng: &mut Rng, max_nesting: i64) -> Vec<Case> {
     let depth = if max_nesting > 0 {
         (max_nesting as usize).min(MAX_NEGATIVE_DEPTH)
     } else {
-        rng.gen_range(2000, 8000) as usize
+        rng.gen_range(4000, 8000) as usize
     };
     // Linear builds: per-level format! reallocation is O(n^2) in depth.
     let mut deep = String::with_capacity(depth * 7 + 1);
@@ -91,18 +98,32 @@ fn nesting_cases(rng: &mut Rng, max_nesting: i64) -> Vec<Case> {
     for k in 0..ladder_n {
         ladder.push_str(&format!("] x{k})"));
     }
+    // The ladder caps at 4000 levels but gates on the same depth:
+    // at depth >= 2000 it holds >= 2000 levels (overflows), below it
+    // holds depth levels (loads), matching the expression case.
+    let overflows = depth >= SOF_CLAIM_DEPTH;
+    let expected_error = if overflows {
+        "StackOverflowError"
+    } else {
+        "none"
+    };
+    let suffix = if overflows {
+        ""
+    } else {
+        "; below overflow threshold, must load"
+    };
     vec![
         Case {
             name: format!("nesting-depth-{depth}"),
             content: format!("(defn deep [] {deep})"),
-            expected_error: "StackOverflowError".to_string(),
-            description: format!("expression nested {depth} deep"),
+            expected_error: expected_error.to_string(),
+            description: format!("expression nested {depth} deep{suffix}"),
         },
         Case {
             name: "nesting-let-ladder".to_string(),
             content: ladder,
-            expected_error: "StackOverflowError".to_string(),
-            description: "deeply nested let chain".to_string(),
+            expected_error: expected_error.to_string(),
+            description: format!("deeply nested let chain ({ladder_n} levels{suffix})"),
         },
     ]
 }
@@ -203,6 +224,28 @@ mod tests {
         let mut rng = Rng::new(11);
         let cases = generate_cases(&mut rng, NegativeKind::Nesting, 50);
         assert!(cases[0].name.contains("depth-50"));
+        // Shallow explicit depths load cleanly; the manifest must not
+        // promise an overflow they never produce.
+        assert_eq!(cases[0].expected_error, "none");
+        assert_eq!(cases[1].expected_error, "none");
+    }
+
+    #[test]
+    fn overflow_claim_gates_on_depth() {
+        // At the claim line both shapes promise StackOverflowError;
+        // the default roll floors above it.
+        let mut rng = Rng::new(11);
+        let cases = generate_cases(&mut rng, NegativeKind::Nesting, 2000);
+        assert_eq!(cases[0].expected_error, "StackOverflowError");
+        assert_eq!(cases[1].expected_error, "StackOverflowError");
+        for seed in 1..20u64 {
+            let mut rng = Rng::new(seed);
+            let cases = generate_cases(&mut rng, NegativeKind::Nesting, 0);
+            assert!(cases[0].name.contains("nesting-depth-"));
+            for c in &cases {
+                assert_eq!(c.expected_error, "StackOverflowError", "seed {seed}");
+            }
+        }
     }
 
     #[test]

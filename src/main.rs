@@ -60,6 +60,15 @@ fn generate_program(seed: u64, options: &Options, policy: &Policy, rng: &mut Rng
             value: m.value,
         });
     }
+    for i in 0..2 {
+        let r = types::random_record(rng);
+        genctx.add_input(&format!("rec-{i}"), CType::Record, r.value.clone());
+        inputs.push(Input {
+            name: format!("rec-{i}"),
+            typ: CType::Record,
+            value: r.value,
+        });
+    }
     let mut outputs = Vec::new();
     for i in 0..n_scalars {
         let c = types::random_const(rng, policy, CType::Long);
@@ -127,10 +136,65 @@ fn generate_to_dir(options: &Options, seed: u64, dir: &std::path::Path) -> Optio
     Some(program)
 }
 
+/// Generation flags the negative path ignores (it uses only seed,
+/// out-dir, and max-nesting): warn rather than silently drop them.
+/// `--count` keeps its own message below.
+fn ignored_negative_flags(options: &Options) -> Vec<&'static str> {
+    let d = Options::default();
+    let mut v = Vec::new();
+    if options.std != d.std {
+        v.push("--std");
+    }
+    if options.check_algo != d.check_algo {
+        v.push("--check-algo");
+    }
+    if options.emit_pragmas != d.emit_pragmas {
+        v.push("--emit-pragmas");
+    }
+    if options.param_shuffle != d.param_shuffle {
+        v.push("--param-shuffle");
+    }
+    if options.expl_loop_param != d.expl_loop_param {
+        v.push("--expl-loop-param");
+    }
+    if options.mutate != d.mutate {
+        v.push("--mutate");
+    }
+    if options.mutation_seed != d.mutation_seed {
+        v.push("--mutation-seed");
+    }
+    if options.allow_exc_in_dead != d.allow_exc_in_dead {
+        v.push("--allow-exc-in-dead");
+    }
+    if options.max_array_dims != d.max_array_dims {
+        v.push("--max-array-dims");
+    }
+    if options.simple_loops != d.simple_loops {
+        v.push("--simple-loops");
+    }
+    if options.unchecked_math != d.unchecked_math {
+        v.push("--unchecked-math");
+    }
+    if options.dg_headers != d.dg_headers {
+        v.push("--dg-headers");
+    }
+    if options.max_fn_cost != d.max_fn_cost {
+        v.push("--max-fn-cost");
+    }
+    if options.top_stmts != d.top_stmts {
+        v.push("--top-stmts");
+    }
+    v
+}
+
 fn run_generate(options: &Options) -> ExitCode {
     if options.negative != NegativeKind::None {
         if options.count != 1 {
             eprintln!("warning: --count is ignored with --negative (one suite)");
+        }
+        let ignored = ignored_negative_flags(options);
+        if !ignored.is_empty() {
+            eprintln!("warning: {} ignored with --negative", ignored.join(", "));
         }
         let mut rng = Rng::new(options.seed);
         let seed = rng.seed();
@@ -312,6 +376,17 @@ fn verify_action(args: &[String]) -> VerifyAction {
     }
 }
 
+/// Backend names in `only` that match no known backend. Unknown
+/// names must error: silently filtering them yields zero runs and a
+/// bare FAIL that reads exactly like a hash mismatch.
+fn unknown_backends(only: &[String]) -> Vec<String> {
+    let known: Vec<&str> = runner::backends().iter().map(|b| b.name).collect();
+    only.iter()
+        .filter(|n| !known.contains(&n.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn run_verify(args: &[String]) -> ExitCode {
     let (dir, only) = match verify_action(args) {
         VerifyAction::Help => {
@@ -328,6 +403,16 @@ fn run_verify(args: &[String]) -> ExitCode {
         }
         VerifyAction::Run { dir, only } => (dir, only),
     };
+    let unknown = unknown_backends(&only);
+    if !unknown.is_empty() {
+        let known: Vec<&str> = runner::backends().iter().map(|b| b.name).collect();
+        eprintln!(
+            "error: unknown backend '{}' (expected one of: {})",
+            unknown.join("', '"),
+            known.join(", ")
+        );
+        return ExitCode::from(2);
+    }
     let classpath = match runner::find_clojure_classpath() {
         Some(cp) => cp,
         None => {
@@ -435,6 +520,42 @@ mod tests {
             }
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unknown_backends_are_reported() {
+        assert!(unknown_backends(&[]).is_empty());
+        assert!(unknown_backends(&words(&["default", "c1-only", "direct-link", "bb"])).is_empty());
+        assert_eq!(unknown_backends(&words(&["c1"])), vec!["c1".to_string()]);
+        assert_eq!(
+            unknown_backends(&words(&["default", "--help"])),
+            vec!["--help".to_string()]
+        );
+    }
+
+    #[test]
+    fn negative_ignores_generation_flags() {
+        use crate::cli::{CheckAlgo, MutateMode};
+        assert!(ignored_negative_flags(&Options::default()).is_empty());
+        // Used flags (seed, out-dir, max-nesting, count) never warn.
+        let used = Options {
+            seed: 7,
+            out_dir: "x".to_string(),
+            max_nesting: 3,
+            count: 9,
+            ..Options::default()
+        };
+        assert!(ignored_negative_flags(&used).is_empty());
+        let ignored = Options {
+            mutate: MutateMode::All,
+            check_algo: CheckAlgo::Asserts,
+            top_stmts: 50,
+            ..Options::default()
+        };
+        assert_eq!(
+            ignored_negative_flags(&ignored),
+            vec!["--check-algo", "--mutate", "--top-stmts"]
+        );
     }
 
     #[test]

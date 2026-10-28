@@ -195,6 +195,18 @@ fn init_forms(program: &Program) -> Vec<Sexp> {
     // later use of the var ("Unable to resolve classname"), as probed
     // against clojure 1.12. Hints are emitted on doseq bindings only.
     let mut forms = vec![Sexp::list(vec![Sexp::sym("ns"), Sexp::sym("gen-init")])];
+    // The record type lives with the inputs it shapes; func.clj
+    // refers gen-init :all, so ->R0/map->R0 resolve there (probed).
+    forms.push(Sexp::list(vec![
+        Sexp::sym("defrecord"),
+        Sexp::sym(crate::types::RECORD_NAME),
+        Sexp::vec(
+            crate::types::REC_FIELDS
+                .iter()
+                .map(|f| Sexp::sym(f))
+                .collect(),
+        ),
+    ]));
     for input in &program.inputs {
         let form = match &input.value {
             Value::Vec(items) => Sexp::list(vec![
@@ -213,6 +225,20 @@ fn init_forms(program: &Program) -> Vec<Sexp> {
                     Sexp::sym("def"),
                     Sexp::sym(&input.name),
                     Sexp::map(pairs),
+                ])
+            }
+            Value::Record(items) => {
+                // Positional construction in declared field order
+                // (REC_FIELDS is alphabetical, matching BTreeMap
+                // order, but spell the order out anyway).
+                let mut ctor = vec![Sexp::sym(&format!("->{}", crate::types::RECORD_NAME))];
+                for f in crate::types::REC_FIELDS {
+                    ctor.push(Sexp::int(items[f]));
+                }
+                Sexp::list(vec![
+                    Sexp::sym("def"),
+                    Sexp::sym(&input.name),
+                    Sexp::list(ctor),
                 ])
             }
             Value::Bool(b) => Sexp::list(vec![
@@ -572,6 +598,36 @@ mod tests {
             .join("\n");
         assert!(flat.contains("TORTURE-PASS"));
         assert!(flat.contains("value mismatch"));
+    }
+
+    #[test]
+    fn record_inputs_emit_defrecord_and_ctors() {
+        // The type form precedes the inputs that construct it, and
+        // positional args follow declared field order.
+        let mut p = sample_program();
+        p.inputs.push(Input {
+            name: "rec-0".to_string(),
+            typ: CType::Record,
+            value: Value::Record(
+                [
+                    ("fb".to_string(), 2),
+                    ("fa".to_string(), 1),
+                    ("fc".to_string(), 3),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        });
+        let forms = init_forms(&p);
+        let flat = forms
+            .iter()
+            .map(|f| f.flat())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("(defrecord R0 [fa fb fc])"), "{flat}");
+        assert!(flat.contains("(def rec-0 (->R0 1 2 3))"), "{flat}");
+        // Unsorted input order still emits positionally.
+        assert!(flat.find("(defrecord").unwrap() < flat.find("(def rec-0").unwrap());
     }
 
     #[test]

@@ -134,6 +134,29 @@ fn mutate_stmt(
                 },
             )
         }
+        Stmt::Destructure {
+            pattern,
+            names,
+            source,
+            values,
+            body,
+        } => {
+            // Sources are immutable with constant values: keep the
+            // bindings, mutate the body. Kept subtrees referencing
+            // the bound locals re-validate by id under whole-program
+            // simulation, as with let.
+            let (next, body) = mutate_scope(rng, policy, genctx, exc_mode, mode, depth, body);
+            (
+                next,
+                Stmt::Destructure {
+                    pattern: pattern.clone(),
+                    names: names.clone(),
+                    source: source.clone(),
+                    values: values.clone(),
+                    body,
+                },
+            )
+        }
         Stmt::Recur {
             var,
             start,
@@ -394,9 +417,9 @@ mod tests {
     #[test]
     fn mutation_scales_re_rolled_bounds_by_depth() {
         // With a constant 64 policy, unscaled re-rolls keep the inner
-        // (depth-1) end at 64; depth-scaled ones halve it to 32. Some
-        // seed must visit the inner loop, and none may produce a
-        // third value.
+        // (depth-1) end at 64; depth-scaled ones halve it to 32; the
+        // zero-trip roll yields 0. Some seed must visit the inner
+        // loop with scaled bounds.
         let policy = Policy {
             iter_end_min: 64,
             iter_end_max: 64,
@@ -414,8 +437,8 @@ mod tests {
             );
             let end = inner_end(&m);
             assert!(
-                end == 64 || end == 32,
-                "seed {seed}: inner end {end}, expected 32 or 64"
+                end == 64 || end == 32 || end == 0,
+                "seed {seed}: inner end {end}, expected 0, 32 or 64"
             );
             saw_scaled |= end == 32;
         }

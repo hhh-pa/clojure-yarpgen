@@ -42,18 +42,21 @@ Each test directory holds four files, mirroring YARPGen's layout:
 
 | File           | Contents                                                     |
 | -------------- | ------------------------------------------------------------ |
-| `init.clj`     | input `def`s: scalars, vectors, keyword maps               |
+| `init.clj`     | `(defrecord R0 …)` + input `def`s: scalars, vectors, maps, records |
 | `func.clj`     | output atoms, `test-fn-N` chunk functions, `outputs` reader  |
 | `driver.clj`   | runs `test-fn`, prints `<hash> <seed>` (or asserts values)   |
 | `expected.edn` | `{:seed … :expected-hash … :check-algo …}` manifest           |
 
-`test-fn` is loop nests (`doseq` over `range` plus `dotimes`),
-`loop`/`recur` blocks with accumulators, `if`/`when` branches,
-sequential `let` blocks, and atom assignments over integer
+`test-fn` is loop nests (`doseq` over `range` plus `dotimes`,
+one in ten zero-trip), `loop`/`recur` blocks with accumulators,
+`if`/`when` branches, sequential `let` blocks, destructuring
+`let`s over vectors and maps, and atom assignments over integer
 arithmetic
 (`+ - * quot rem inc dec abs`), bit operations, comparisons,
-`min`/`max`, vector `nth`, and map reads (`get`, keyword-invoke,
-`get`-with-default, reads through `assoc`). Top-level statements are chunked into
+`min`/`max`, vector `nth`, map reads (`get`, keyword-invoke,
+`get`-with-default, reads through `assoc`), and record reads over
+`(defrecord R0 [fa fb fc])` inputs and fresh `(->R0 …)` /
+`(map->R0 …)` constructions. Top-level statements are chunked into
 sequential `test-fn-N` functions so no single method nears the 64KB
 JVM limit (`--top-stmts` scales program size, `--max-fn-cost` the
 per-function budget). Example fragment:
@@ -102,10 +105,11 @@ Ported from YARPGen's probability tables:
 | loop nests           | depth 2–3 (cap 5); 10–25 halve per depth, step 1–4|
 | `loop`/`recur`       | counter + 0–2 accumulators, depth-scaled bounds|
 | `let` blocks         | 1–3 sequential bindings, depth ≤ 5             |
+| destructuring        | 1–3 names over vec/map literals or inputs      |
 | `if`/`else`          | depth ≤ 5, else-branch 20%                     |
 | expression depth     | ≤ 4                                            |
-| inputs/outputs       | 10–20 scalars + 2 vectors + 2 maps             |
-| structures           | loop/doseq, nest, if, let, recur 10 each, stub 50|
+| inputs/outputs       | 10–20 scalars + 2 vectors + 2 maps + 2 records |
+| structures           | loop/doseq, nest, if, let, recur, destructure 10 each, stub 50|
 | assign vs reduction  | 70 / 30                                        |
 | SimilarOperators     | 10% single-family expressions                  |
 | ConstUse             | 10% all-const leaves                           |
@@ -170,7 +174,7 @@ with expected errors:
 | ------- | ------------------------------------------------------------ |
 | `arity` | >20 params, double variadic overloads                        |
 | `recur` | non-tail `recur`, `recur` across `try`, arity mismatch       |
-| `nesting`| deep expression/`let` ladders (expect `StackOverflowError`) |
+| `nesting`| deep expression/`let` ladders (`StackOverflowError` at depth ≥ 2000; shallower explicit depths must load and say `none`) |
 | `hints` | primitive+variadic, wrongly-hinted locals                    |
 | `all`   | everything                                                   |
 

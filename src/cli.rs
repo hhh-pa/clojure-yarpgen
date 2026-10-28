@@ -2,7 +2,8 @@
 //! Command-line options. Ports YARPGen's options.h/options.cpp:
 //! long `--arg=value` plus short `-s`/`-o`/`-h`/`-v` forms.
 
-pub const VERSION: &str = "0.1.0";
+/// Crate version, wired to Cargo.toml so `--version` can never drift.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Std {

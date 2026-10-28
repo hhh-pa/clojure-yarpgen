@@ -20,6 +20,26 @@ fn k_in_range(k: i64, len: usize) -> bool {
     k >= 0 && k < len as i64
 }
 
+/// A destructuring pattern: sequential positions are an implied
+/// 0-based prefix, while map patterns carry one explicit key per
+/// name (`{local :key}` keeps local names unique — `:keys` would
+/// force same-name bindings and collide across scopes).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DestrPattern {
+    Seq,
+    Map(Vec<String>),
+}
+
+/// A destructuring source: a small literal, or an immutable
+/// vector/map/record input by name (never an atom: inputs are plain
+/// defs).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DestrSource {
+    VecLit(Vec<i64>),
+    MapLit(Vec<(String, i64)>),
+    Var(String),
+}
+
 /// Statement AST.
 #[derive(Clone, Debug)]
 pub enum Stmt {
@@ -69,6 +89,20 @@ pub enum Stmt {
         end: i64,
         step: i64,
         accs: Vec<(String, Expr, Expr)>,
+        body: Vec<Stmt>,
+    },
+    /// A `(let [pattern source] ...)` with a sequential or map
+    /// destructuring pattern over an immutable source. Bound values
+    /// are constants (positions of a known vector, present keys of a
+    /// known map or record), so simulation re-binds them without
+    /// evaluation. Patterns stay flat and total: over-long patterns
+    /// and absent keys would bind nil, which the model cannot
+    /// represent.
+    Destructure {
+        pattern: DestrPattern,
+        names: Vec<String>,
+        source: DestrSource,
+        values: Vec<i64>,
         body: Vec<Stmt>,
     },
 }
@@ -141,12 +175,39 @@ fn live_value(genctx: &GenCtx, node: &Expr) -> Ir {
                     items.insert(key.clone(), v.value.as_long());
                     Ir::new(CType::Map, Value::Map(items), crate::types::ExKind::NoEx)
                 }
+                // Assoc of an existing field stays a record (probed);
+                // generation never assocs new keys onto records.
+                Value::Record(mut items) => {
+                    items.insert(key.clone(), v.value.as_long());
+                    Ir::new(
+                        CType::Record,
+                        Value::Record(items),
+                        crate::types::ExKind::NoEx,
+                    )
+                }
                 _ => Ir::new(
                     CType::Map,
                     Value::Map(Default::default()),
                     crate::types::ExKind::Oob,
                 ),
             }
+        }
+        Expr::Record { args, .. } => {
+            // Args run in REC_FIELDS order; both constructors agree
+            // (probed), so the form needs no modeling.
+            let mut items = std::collections::BTreeMap::new();
+            for (f, a) in types::REC_FIELDS.iter().zip(args.iter()) {
+                let v = live_value(genctx, a);
+                if !v.is_ok() {
+                    return Ir::new(CType::Record, Value::Record(Default::default()), v.ex);
+                }
+                items.insert(f.to_string(), v.value.as_long());
+            }
+            Ir::new(
+                CType::Record,
+                Value::Record(items),
+                crate::types::ExKind::NoEx,
+            )
         }
         Expr::Get {
             coll, key, default, ..
@@ -156,7 +217,9 @@ fn live_value(genctx: &GenCtx, node: &Expr) -> Ir {
                 return Ir::new(CType::Long, Value::Long(0), c.ex);
             }
             match &c.value {
-                Value::Map(items) => match items.get(key) {
+                // Records read exactly like maps; generation only
+                // asks present fields, so no default form exists.
+                Value::Map(items) | Value::Record(items) => match items.get(key) {
                     Some(n) => Ir::long(*n),
                     // The default always evaluates, so its faults
                     // propagate exactly like NthDefault's.
@@ -314,6 +377,25 @@ fn try_simulate_stmt(
             genctx.truncate_to(snap);
             Ok(())
         }
+        Stmt::Destructure {
+            names,
+            values,
+            body,
+            ..
+        } => {
+            // Sources are immutable with constant values: re-bind the
+            // same names in order (mirroring population exactly, so
+            // ids realign) and simulate the body. No evaluation, so
+            // no fault is possible here in either mode.
+            let snap = genctx.snapshot_len();
+            for (name, v) in names.iter().zip(values.iter()) {
+                *budget = budget.checked_sub(1).ok_or(SimErr::Budget)?;
+                genctx.add_local(name, CType::Long, Value::Long(*v));
+            }
+            try_simulate_stmts(genctx, body, budget, strict)?;
+            genctx.truncate_to(snap);
+            Ok(())
+        }
     }
 }
 
@@ -387,6 +469,13 @@ pub fn shrink_loop_bounds(stmt: &mut Stmt) -> bool {
                 *end = (*end / 2).max(2);
                 shrunk = true;
             }
+            for b in body.iter_mut() {
+                shrunk |= shrink_loop_bounds(b);
+            }
+            shrunk
+        }
+        Stmt::Destructure { body, .. } => {
+            let mut shrunk = false;
             for b in body.iter_mut() {
                 shrunk |= shrink_loop_bounds(b);
             }
@@ -597,6 +686,128 @@ fn gen_recur(
         }
     }
     populate_stub_scope(rng, policy, genctx.clone(), exc_mode, depth)
+}
+
+/// A `let` with a destructuring pattern over an immutable source:
+/// a sequential prefix of a known vector, or present keys of a known
+/// map. Sources are small literals or vector/map inputs; patterns
+/// never overrun (names fit the length, keys are present), so no nil
+/// can arise. Values are constants, so no validation is needed —
+/// population binds and simulates exactly once.
+fn gen_destructure(
+    rng: &mut Rng,
+    policy: &Policy,
+    genctx: &GenCtx,
+    exc_mode: Density,
+    depth: i64,
+    tag: &str,
+) -> (GenCtx, Vec<Stmt>) {
+    let seq = rng.roll(0.5);
+    let cands: Vec<VarId> = genctx
+        .all_vars()
+        .into_iter()
+        .filter(|id| {
+            let t = genctx.var_type(*id);
+            // Records destructure as maps (same `get` lookups).
+            if seq {
+                t == CType::Vec
+            } else {
+                t == CType::Map || t == CType::Record
+            }
+        })
+        .collect();
+    // Prefer a var source when one with a non-empty value exists
+    // (inputs always qualify); otherwise use a small literal. The
+    // length check keeps over-long patterns impossible by
+    // construction: names always fit the source.
+    let mut var_pick: Option<VarId> = None;
+    if !cands.is_empty() && rng.roll(0.5) {
+        let id = *rng.pick(&cands);
+        let len = match genctx.var_value(id) {
+            Value::Vec(items) => items.len(),
+            Value::Map(items) | Value::Record(items) => items.len(),
+            _ => 0,
+        };
+        if len > 0 {
+            var_pick = Some(id);
+        }
+    }
+    let (pattern, names, source, values) = if seq {
+        let items: Vec<i64> = match var_pick {
+            Some(id) => match genctx.var_value(id) {
+                // Only the destructured prefix (≤ 3) is ever read;
+                // cloning a 64K-element input to keep it is waste.
+                Value::Vec(items) => items.iter().take(3).copied().collect(),
+                // Unreachable: length-checked above.
+                _ => vec![0, 0],
+            },
+            None => (0..rng.gen_range(2, 4))
+                .map(|_| rng.gen_range(-100, 100))
+                .collect(),
+        };
+        let n = rng.gen_range(1, items.len().min(3) as i64) as usize;
+        let names: Vec<String> = (0..n).map(|k| format!("d_{tag}_{k}")).collect();
+        let values = items[..n].to_vec();
+        let source = match var_pick {
+            Some(id) => DestrSource::Var(genctx.var_name(id).to_string()),
+            None => DestrSource::VecLit(items),
+        };
+        (DestrPattern::Seq, names, source, values)
+    } else {
+        let items: Vec<(String, i64)> = match var_pick {
+            Some(id) => match genctx.var_value(id) {
+                Value::Map(items) | Value::Record(items) => {
+                    items.iter().map(|(k, v)| (k.clone(), *v)).collect()
+                }
+                // Unreachable: length-checked above.
+                _ => vec![("ka".to_string(), 0)],
+            },
+            None => match types::random_map(rng).value {
+                Value::Map(items) => items.into_iter().collect(),
+                // Unreachable: random_map always yields a map.
+                _ => vec![("ka".to_string(), 0)],
+            },
+        };
+        // Random key subset, Fisher-Yates prefix over a few keys.
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        for i in (1..order.len()).rev() {
+            let j = rng.gen_usize(i + 1);
+            order.swap(i, j);
+        }
+        let n = rng.gen_range(1, items.len().min(3) as i64) as usize;
+        let mut names = Vec::with_capacity(n);
+        let mut keys = Vec::with_capacity(n);
+        let mut values = Vec::with_capacity(n);
+        for (k, oi) in order[..n].iter().enumerate() {
+            names.push(format!("d_{tag}_{k}"));
+            keys.push(items[*oi].0.clone());
+            values.push(items[*oi].1);
+        }
+        let source = match var_pick {
+            Some(id) => DestrSource::Var(genctx.var_name(id).to_string()),
+            None => DestrSource::MapLit(items),
+        };
+        (DestrPattern::Map(keys), names, source, values)
+    };
+    let mut ctx = genctx.clone();
+    let snap = ctx.snapshot_len();
+    for (name, v) in names.iter().zip(values.iter()) {
+        ctx.add_local(name, CType::Long, Value::Long(*v));
+    }
+    ctx.let_depth += 1;
+    let (mut after, body) = populate_scope(rng, policy, ctx, exc_mode, depth + 1);
+    after.truncate_to(snap);
+    after.let_depth = genctx.let_depth;
+    (
+        after,
+        vec![Stmt::Destructure {
+            pattern,
+            names,
+            source,
+            values,
+            body,
+        }],
+    )
 }
 
 /// Populate a straight-line scope (assignments only). Used when a loop
@@ -815,6 +1026,14 @@ fn populate_one(
                 assign_or(rng, policy, genctx, exc_mode)
             }
         }
+        StructKind::Destructure => {
+            // Binding forms share let's depth budget.
+            if total_depth < policy.let_nest_limit {
+                gen_destructure(rng, policy, genctx, exc_mode, depth, tag)
+            } else {
+                assign_or(rng, policy, genctx, exc_mode)
+            }
+        }
         StructKind::Stub => assign_or(rng, policy, genctx, exc_mode),
     }
 }
@@ -1015,6 +1234,42 @@ pub fn to_sexp(stmt: &Stmt, atoms: &BTreeSet<String>) -> Sexp {
                 ]),
             ])
         }
+        Stmt::Destructure {
+            pattern,
+            names,
+            source,
+            body,
+            ..
+        } => {
+            let src = match source {
+                DestrSource::VecLit(items) => {
+                    Sexp::vec(items.iter().map(|n| Sexp::int(*n)).collect())
+                }
+                DestrSource::MapLit(pairs) => {
+                    let mut flat = Vec::with_capacity(pairs.len() * 2);
+                    for (k, v) in pairs {
+                        flat.push(Sexp::sym(&format!(":{k}")));
+                        flat.push(Sexp::int(*v));
+                    }
+                    Sexp::map(flat)
+                }
+                DestrSource::Var(name) => Sexp::sym(name),
+            };
+            let pat = match pattern {
+                DestrPattern::Seq => Sexp::vec(names.iter().map(|n| Sexp::sym(n)).collect()),
+                DestrPattern::Map(keys) => {
+                    let mut flat = Vec::with_capacity(names.len() * 2);
+                    for (n, k) in names.iter().zip(keys.iter()) {
+                        flat.push(Sexp::sym(n));
+                        flat.push(Sexp::sym(&format!(":{k}")));
+                    }
+                    Sexp::map(flat)
+                }
+            };
+            let mut items = vec![Sexp::sym("let"), Sexp::vec(vec![pat, src])];
+            items.extend(body.iter().map(|s| to_sexp(s, atoms)));
+            Sexp::list(items)
+        }
     }
 }
 
@@ -1148,6 +1403,7 @@ mod tests {
                 Stmt::Loop { body, .. } | Stmt::Dotimes { body, .. } => collect_targets(body, out),
                 Stmt::Let { body, .. } => collect_targets(body, out),
                 Stmt::Recur { body, .. } => collect_targets(body, out),
+                Stmt::Destructure { body, .. } => collect_targets(body, out),
             }
         }
     }
@@ -1276,6 +1532,69 @@ mod tests {
         assert_eq!(simulate_bounded(&mut ctx, &prog), Err(SimErr::Fault));
     }
 
+    #[test]
+    fn zero_trip_loops_skip_the_body() {
+        // end 0: the exit test fails at entry, so even a body that
+        // would fault never executes — strict simulation must pass
+        // and outputs keep their entry values. Recur accumulators
+        // likewise keep their inits.
+        let mut ctx = seeded_ctx();
+        let oid = ctx.id_of("out-0").unwrap();
+        let fault = Expr::BinOp {
+            op: BinOp::Div,
+            left: Box::new(Expr::Const(Ir::long(1))),
+            right: Box::new(Expr::Const(Ir::long(0))),
+            ir: Ir::long(0),
+        };
+        let mk = |expr: Expr| Stmt::Loop {
+            var: "i".to_string(),
+            start: 0,
+            end: 0,
+            step: 1,
+            body: vec![Stmt::Assign {
+                target: "out-0".to_string(),
+                target_id: oid,
+                expr,
+            }],
+        };
+        assert_eq!(simulate_bounded(&mut ctx, &[mk(fault)]), Ok(()));
+        let dot = Stmt::Dotimes {
+            var: "j".to_string(),
+            end: 0,
+            body: vec![Stmt::Assign {
+                target: "out-0".to_string(),
+                target_id: oid,
+                expr: Expr::Const(Ir::long(99)),
+            }],
+        };
+        assert_eq!(simulate_bounded(&mut ctx, &[dot]), Ok(()));
+        assert_eq!(ctx.lookup("out-0").unwrap().as_long(), 0);
+        let rec = Stmt::Recur {
+            var: "r".to_string(),
+            start: 0,
+            end: 0,
+            step: 1,
+            accs: vec![(
+                "ra".to_string(),
+                Expr::Const(Ir::long(5)),
+                Expr::Const(Ir::long(7)),
+            )],
+            body: vec![Stmt::Assign {
+                target: "out-0".to_string(),
+                target_id: oid,
+                expr: Expr::Var {
+                    id: ctx.id_of("out-0").unwrap(),
+                    name: "out-0".to_string(),
+                    ir: Ir::long(0),
+                },
+            }],
+        };
+        assert_eq!(simulate_bounded(&mut ctx, &[rec]), Ok(()));
+        // Counter and accumulator locals leave scope with the loop.
+        assert!(ctx.id_of("r").is_none());
+        assert!(ctx.id_of("ra").is_none());
+    }
+
     fn map_ctx() -> (GenCtx, crate::context::VarId, crate::context::VarId) {
         let mut ctx = GenCtx::new();
         let items: std::collections::BTreeMap<String, i64> =
@@ -1356,6 +1675,67 @@ mod tests {
         }];
         assert_eq!(simulate_bounded(&mut ctx, &prog), Ok(()));
         assert_eq!(ctx.lookup("out-0").unwrap().as_long(), 7);
+    }
+
+    #[test]
+    fn simulation_threads_records() {
+        // Fresh construction evaluates args in field order; reads
+        // hit fields; assoc of an existing field stays a record with
+        // the overwritten value.
+        let ctx = seeded_ctx();
+        let rec = Expr::Record {
+            args: vec![
+                Expr::Const(Ir::long(1)),
+                Expr::Const(Ir::long(2)),
+                Expr::Const(Ir::long(3)),
+            ],
+            map_ctor: false,
+            ir: Ir::long(0),
+        };
+        let v = live_value(&ctx, &rec);
+        assert_eq!(v.typ, CType::Record);
+        match &v.value {
+            Value::Record(items) => {
+                assert_eq!(items.get("fa"), Some(&1));
+                assert_eq!(items.get("fb"), Some(&2));
+                assert_eq!(items.get("fc"), Some(&3));
+            }
+            other => panic!("expected record, got {other:?}"),
+        }
+        let get = Expr::Get {
+            coll: Box::new(rec),
+            key: "fb".to_string(),
+            default: None,
+            kw: true,
+            ir: Ir::long(2),
+        };
+        assert_eq!(live_value(&ctx, &get).value, Value::Long(2));
+        // map_ctor agrees with positional (probed): same node shape
+        // modulo the flag evaluates identically.
+        let map_built = Expr::Record {
+            args: vec![
+                Expr::Const(Ir::long(4)),
+                Expr::Const(Ir::long(5)),
+                Expr::Const(Ir::long(6)),
+            ],
+            map_ctor: true,
+            ir: Ir::long(0),
+        };
+        let assoc = Expr::Assoc {
+            coll: Box::new(map_built),
+            key: "fa".to_string(),
+            val: Box::new(Expr::Const(Ir::long(9))),
+            ir: Ir::long(0),
+        };
+        let av = live_value(&ctx, &assoc);
+        assert_eq!(av.typ, CType::Record);
+        match &av.value {
+            Value::Record(items) => {
+                assert_eq!(items.get("fa"), Some(&9));
+                assert_eq!(items.len(), 3);
+            }
+            other => panic!("expected record, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1453,6 +1833,168 @@ mod tests {
             to_sexp(&s, &atoms).flat(),
             "(let [l1 1 l2 2] (reset! out-0 3))"
         );
+    }
+
+    #[test]
+    fn destructure_emission_shapes() {
+        let atoms: BTreeSet<String> = ["out-0".to_string()].into_iter().collect();
+        let mut ctx = GenCtx::new();
+        let oid = ctx.add_output("out-0", CType::Long, Value::Long(0));
+        let body = || {
+            vec![Stmt::Assign {
+                target: "out-0".to_string(),
+                target_id: oid,
+                expr: Expr::Const(Ir::long(1)),
+            }]
+        };
+        let seq = Stmt::Destructure {
+            pattern: DestrPattern::Seq,
+            names: vec!["d_0".to_string(), "d_1".to_string()],
+            source: DestrSource::Var("vec-0".to_string()),
+            values: vec![7, 8],
+            body: body(),
+        };
+        assert_eq!(
+            to_sexp(&seq, &atoms).flat(),
+            "(let [[d_0 d_1] vec-0] (reset! out-0 1))"
+        );
+        let lit = Stmt::Destructure {
+            pattern: DestrPattern::Seq,
+            names: vec!["d_0".to_string()],
+            source: DestrSource::VecLit(vec![5, 6]),
+            values: vec![5],
+            body: body(),
+        };
+        assert_eq!(
+            to_sexp(&lit, &atoms).flat(),
+            "(let [[d_0] [5 6]] (reset! out-0 1))"
+        );
+        let map = Stmt::Destructure {
+            pattern: DestrPattern::Map(vec!["ka".to_string(), "kc".to_string()]),
+            names: vec!["d_0".to_string(), "d_1".to_string()],
+            source: DestrSource::Var("map-0".to_string()),
+            values: vec![1, 3],
+            body: body(),
+        };
+        assert_eq!(
+            to_sexp(&map, &atoms).flat(),
+            "(let [{d_0 :ka d_1 :kc} map-0] (reset! out-0 1))"
+        );
+        let mlit = Stmt::Destructure {
+            pattern: DestrPattern::Map(vec!["kb".to_string()]),
+            names: vec!["d_0".to_string()],
+            source: DestrSource::MapLit(vec![("kb".to_string(), 2)]),
+            values: vec![2],
+            body: body(),
+        };
+        assert_eq!(
+            to_sexp(&mlit, &atoms).flat(),
+            "(let [{d_0 :kb} {:kb 2}] (reset! out-0 1))"
+        );
+    }
+
+    #[test]
+    fn destructure_binds_values_and_restores_scope() {
+        // Bound values are visible in the body and locals leave scope
+        // on exit, exactly like let bindings.
+        let ctx = seeded_ctx();
+        let oid = ctx.id_of("out-0").unwrap();
+        // The destructure binds "d" as the next interned id.
+        let did = VarId(ctx.snapshot_len() as u32);
+        let s = Stmt::Destructure {
+            pattern: DestrPattern::Seq,
+            names: vec!["d".to_string()],
+            source: DestrSource::VecLit(vec![42, 43]),
+            values: vec![42],
+            body: vec![Stmt::Assign {
+                target: "out-0".to_string(),
+                target_id: oid,
+                expr: Expr::Var {
+                    id: did,
+                    name: "d".to_string(),
+                    ir: Ir::long(42),
+                },
+            }],
+        };
+        let mut sim = ctx;
+        assert_eq!(simulate_bounded(&mut sim, &[s]), Ok(()));
+        assert_eq!(sim.lookup("out-0").unwrap().as_long(), 42);
+        assert!(sim.id_of("d").is_none());
+    }
+
+    fn destructure_ctx() -> GenCtx {
+        let mut ctx = seeded_ctx();
+        ctx.add_input("vec-0", CType::Vec, Value::Vec(vec![1, 2, 3]));
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("ka".to_string(), 4);
+        m.insert("kc".to_string(), 6);
+        ctx.add_input("map-0", CType::Map, Value::Map(m));
+        let mut r = std::collections::BTreeMap::new();
+        r.insert("fa".to_string(), 7);
+        r.insert("fb".to_string(), 8);
+        r.insert("fc".to_string(), 9);
+        ctx.add_input("rec-0", CType::Record, Value::Record(r));
+        ctx
+    }
+
+    fn collect_destr_sources(stmts: &[Stmt], out: &mut Vec<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Destructure { source, body, .. } => {
+                    match source {
+                        DestrSource::Var(name) => out.push(name.clone()),
+                        DestrSource::VecLit(_) => out.push("<veclit>".to_string()),
+                        DestrSource::MapLit(_) => out.push("<maplit>".to_string()),
+                    }
+                    // Bodies nest under the same forced policy.
+                    collect_destr_sources(body, out);
+                }
+                Stmt::If { then, els, .. } => {
+                    collect_destr_sources(then, out);
+                    collect_destr_sources(els, out);
+                }
+                Stmt::Loop { body, .. }
+                | Stmt::Dotimes { body, .. }
+                | Stmt::Let { body, .. }
+                | Stmt::Recur { body, .. } => collect_destr_sources(body, out),
+                Stmt::Assign { .. } => {}
+            }
+        }
+    }
+
+    #[test]
+    fn destructure_populates_cleanly() {
+        // A destructure-only policy yields destructuring blocks over
+        // literals and input vars (vectors, maps, and records); every
+        // yielded statement fits one function and simulates cleanly
+        // under strict bounds.
+        let mut saw_rec_source = false;
+        for seed in 1..30u64 {
+            let mut rng = Rng::new(seed);
+            let policy = Policy {
+                struct_distr: vec![(StructKind::Destructure, 1)],
+                ..Policy::default()
+            };
+            let ctx = destructure_ctx();
+            let atoms: BTreeSet<String> = ctx.output_names().into_iter().collect();
+            let (final_ctx, stmts) = populate_top_scope(&mut rng, &policy, ctx, Density::None);
+            assert!(!stmts.is_empty(), "seed {seed}: no statements");
+            for s in &stmts {
+                assert!(stmt_fits(s, &atoms), "seed {seed}: oversized {s:?}");
+            }
+            let mut sources = Vec::new();
+            collect_destr_sources(&stmts, &mut sources);
+            saw_rec_source |= sources.iter().any(|n| n == "rec-0");
+            let mut sim = destructure_ctx();
+            assert_eq!(
+                simulate_bounded_whole(&mut sim, &stmts),
+                Ok(()),
+                "seed {seed}: strict simulation fault"
+            );
+            assert_eq!(sim.lookup("out-0"), final_ctx.lookup("out-0"));
+            assert_eq!(final_ctx.let_depth, 0, "seed {seed}: let_depth leaked");
+        }
+        assert!(saw_rec_source, "no destructure ever sourced rec-0");
     }
 
     #[test]

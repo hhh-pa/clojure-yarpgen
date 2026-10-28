@@ -77,6 +77,12 @@ fn walk_expr(e: &Expr, counts: &mut BTreeMap<String, i64>) {
             walk_expr(coll, counts);
             walk_expr(val, counts);
         }
+        Expr::Record { args, .. } => {
+            bump(counts, "records");
+            for a in args {
+                walk_expr(a, counts);
+            }
+        }
     }
 }
 
@@ -132,6 +138,13 @@ fn walk_stmt(s: &Stmt, counts: &mut BTreeMap<String, i64>, depth: i64) {
                 walk_stmt(b, counts, depth + 1);
             }
         }
+        Stmt::Destructure { body, .. } => {
+            bump(counts, "lets");
+            bump(counts, "destructures");
+            for b in body {
+                walk_stmt(b, counts, depth + 1);
+            }
+        }
     }
 }
 
@@ -160,6 +173,7 @@ pub fn stmt_cost(s: &Stmt) -> u64 {
                 .sum::<u64>()
                 + body.iter().map(stmt_cost).sum::<u64>()
         }
+        Stmt::Destructure { body, .. } => 2 + body.iter().map(stmt_cost).sum::<u64>(),
     }
 }
 
@@ -177,5 +191,6 @@ pub fn expr_cost(e: &Expr) -> u64 {
             expr_cost(coll) + default.as_ref().map_or(0, |d| expr_cost(d))
         }
         Expr::Assoc { coll, val, .. } => expr_cost(coll) + expr_cost(val),
+        Expr::Record { args, .. } => args.iter().map(expr_cost).sum(),
     }
 }

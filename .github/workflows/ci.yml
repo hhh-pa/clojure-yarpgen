@@ -36,4 +36,8 @@ jobs:
       - name: Fuzz end-to-end
         env:
           CLOJURE_CP: /tmp/clj-cp/clojure-1.12.0.jar:/tmp/clj-cp/spec.alpha-0.5.238.jar:/tmp/clj-cp/core.specs.alpha-0.4.74.jar
-        run: ./target/release/clojure-yarpgen fuzz -s 1 --count 4 -o out/ci-fuzz
+        run: ./target/release/clojure-yarpgen fuzz -s 1 --count 8 -o out/ci-fuzz
+      - name: Fuzz asserts oracle
+        env:
+          CLOJURE_CP: /tmp/clj-cp/clojure-1.12.0.jar:/tmp/clj-cp/spec.alpha-0.5.238.jar:/tmp/clj-cp/core.specs.alpha-0.4.74.jar
+        run: ./target/release/clojure-yarpgen fuzz -s 101 --count 4 --check-algo asserts -o out/ci-fuzz-asserts

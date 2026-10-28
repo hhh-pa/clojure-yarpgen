@@ -34,6 +34,7 @@ pub enum CType {
     ULong,
     Vec,
     Map,
+    Record,
 }
 
 impl CType {
@@ -46,11 +47,12 @@ impl CType {
             CType::ULong => (0, i64::MAX),
             CType::Vec => (0, 0),
             CType::Map => (0, 0),
+            CType::Record => (0, 0),
         }
     }
 
     pub fn is_scalar(self) -> bool {
-        !matches!(self, CType::Vec | CType::Bool | CType::Map)
+        !matches!(self, CType::Vec | CType::Bool | CType::Map | CType::Record)
     }
 }
 
@@ -60,6 +62,7 @@ pub enum Value {
     Bool(bool),
     Vec(Vec<i64>),
     Map(BTreeMap<String, i64>),
+    Record(BTreeMap<String, i64>),
 }
 
 impl Value {
@@ -69,6 +72,7 @@ impl Value {
             Value::Bool(b) => i64::from(*b),
             Value::Vec(v) => v.len() as i64,
             Value::Map(m) => m.len() as i64,
+            Value::Record(m) => m.len() as i64,
         }
     }
 }
@@ -468,13 +472,31 @@ pub fn random_map(rng: &mut Rng) -> Ir {
     Ir::new(CType::Map, Value::Map(map), ExKind::NoEx)
 }
 
+/// The one record type every program defines: `(defrecord R0 [fa fb
+/// fc])`, emitted in init.clj. Fixed fields keep positional
+/// construction arity-correct by construction; every record value
+/// holds exactly these keys (sorted order doubles as field order).
+pub const RECORD_NAME: &str = "R0";
+/// Field vocabulary, alphabetical so BTreeMap order matches the
+/// declared field vector.
+pub const REC_FIELDS: [&str; 3] = ["fa", "fb", "fc"];
+
+/// Random record constant: all three fields with small values.
+pub fn random_record(rng: &mut Rng) -> Ir {
+    let map: BTreeMap<String, i64> = REC_FIELDS
+        .iter()
+        .map(|k| (k.to_string(), rng.gen_range(-100, 100)))
+        .collect();
+    Ir::new(CType::Record, Value::Record(map), ExKind::NoEx)
+}
+
 /// Clojure truthiness for branch conditions: only `false` and `nil`
 /// are falsey. Note `0` and `[]` are truthy, unlike in C.
 pub fn coerce_bool(v: &Ir) -> bool {
     match &v.value {
         Value::Bool(b) => *b,
-        // Probed: even `{}` is truthy.
-        Value::Long(_) | Value::Vec(_) | Value::Map(_) => true,
+        // Probed: even `{}` is truthy (records are maps).
+        Value::Long(_) | Value::Vec(_) | Value::Map(_) | Value::Record(_) => true,
     }
 }
 
@@ -639,5 +661,35 @@ mod tests {
         assert!(!CType::Map.is_scalar());
         let m = Ir::new(CType::Map, Value::Map(BTreeMap::new()), ExKind::NoEx);
         assert!(coerce_bool(&m));
+    }
+
+    #[test]
+    fn random_record_holds_all_fields() {
+        // Total by construction: every field present, so positional
+        // construction is always arity-correct.
+        for seed in 1..50u64 {
+            let mut rng = Rng::new(seed);
+            let r = random_record(&mut rng);
+            assert_eq!(r.typ, CType::Record);
+            assert!(r.is_ok());
+            match &r.value {
+                Value::Record(items) => {
+                    assert_eq!(items.len(), REC_FIELDS.len());
+                    for f in REC_FIELDS {
+                        let v = items
+                            .get(f)
+                            .unwrap_or_else(|| panic!("seed {seed}: missing {f}"));
+                        assert!((-100..=100).contains(v));
+                    }
+                }
+                other => panic!("expected record value, got {other:?}"),
+            }
+        }
+        assert!(!CType::Record.is_scalar());
+        // Sorted order must match the declared field vector, which
+        // doubles as positional-constructor order.
+        let mut sorted = REC_FIELDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, REC_FIELDS);
     }
 }

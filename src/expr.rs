@@ -9,6 +9,7 @@ use crate::policy::{NodeKind, Policy};
 use crate::rng::Rng;
 use crate::sexp::Sexp;
 use crate::types::{self, BinOp, CType, ExKind, Ir, UnOp, Value};
+use std::collections::BTreeMap;
 
 const MAX_REBUILD_ATTEMPTS: i32 = 8;
 
@@ -70,6 +71,15 @@ pub enum Expr {
         val: Box<Expr>,
         ir: Ir,
     },
+    /// Fresh record construction. Emits `(->R0 a b c)` or the
+    /// `(map->R0 {:fa a :fb b :fc c})` form (same value, different
+    /// constructor codegen); the IR is the whole record. Appears only
+    /// as a Get/Assoc collection: records are not scalars.
+    Record {
+        args: Vec<Expr>,
+        map_ctor: bool,
+        ir: Ir,
+    },
 }
 
 impl Expr {
@@ -84,6 +94,7 @@ impl Expr {
             Expr::IdxMod { ir, .. } => ir,
             Expr::Get { ir, .. } => ir,
             Expr::Assoc { ir, .. } => ir,
+            Expr::Record { ir, .. } => ir,
         }
     }
 }
@@ -259,8 +270,10 @@ fn gen_nth(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr 
     if !idx.ir().is_ok() {
         idx = leaf(rng, policy, genctx, false, false);
     }
+    // Borrow, never clone: only one element and the length are
+    // read, and inputs can span 64K elements.
     let items = match genctx.var_value(v) {
-        Value::Vec(items) => items.clone(),
+        Value::Vec(items) => items,
         _ => return Expr::Const(types::random_const(rng, policy, CType::Long)),
     };
     let wrap_coll = coll.clone();
@@ -304,6 +317,98 @@ fn gen_nth(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr 
     }
 }
 
+/// A fresh record construction with clean scalar args in field
+/// order. Probed: `(->R0 a b c)` and `(map->R0 {:fa a :fb b :fc c})`
+/// agree exactly. Faulty args become leaves (every argument always
+/// evaluates), so the node is clean by construction.
+fn fresh_record(
+    rng: &mut Rng,
+    policy: &Policy,
+    genctx: &GenCtx,
+    depth: i64,
+) -> (Expr, BTreeMap<String, i64>) {
+    let mut args = Vec::with_capacity(types::REC_FIELDS.len());
+    let mut values = BTreeMap::new();
+    for f in types::REC_FIELDS {
+        let mut arg = generate(rng, policy, genctx, depth + 1, false, &None);
+        if !arg.ir().is_ok() {
+            arg = leaf(rng, policy, genctx, false, false);
+        }
+        values.insert(f.to_string(), arg.ir().value.as_long());
+        args.push(arg);
+    }
+    let ir = Ir::new(CType::Record, Value::Record(values.clone()), ExKind::NoEx);
+    (
+        Expr::Record {
+            args,
+            map_ctor: rng.roll(0.5),
+            ir,
+        },
+        values,
+    )
+}
+
+/// Record read. The collection is a record input or a fresh
+/// construction; reads hit present fields via `get` or
+/// keyword-invoke. Records are total (all fields always present), so
+/// no default form exists; assoc wraps use existing fields only,
+/// which provably stay records.
+fn gen_record_get(
+    rng: &mut Rng,
+    policy: &Policy,
+    genctx: &GenCtx,
+    depth: i64,
+    records: &[VarId],
+) -> Expr {
+    let (base, items) = if rng.roll(0.4) {
+        fresh_record(rng, policy, genctx, depth)
+    } else {
+        let v = *rng.pick(records);
+        match genctx.var_value(v) {
+            Value::Record(items) => {
+                let var = Expr::Var {
+                    id: v,
+                    name: genctx.var_name(v).to_string(),
+                    ir: Ir::new(CType::Record, Value::Record(items.clone()), ExKind::NoEx),
+                };
+                (var, items.clone())
+            }
+            _ => fresh_record(rng, policy, genctx, depth),
+        }
+    };
+    let (coll, items) = if rng.roll(0.3) {
+        let key = (*rng.pick(&types::REC_FIELDS)).to_string();
+        let mut val = generate(rng, policy, genctx, depth + 1, false, &None);
+        if !val.ir().is_ok() {
+            val = leaf(rng, policy, genctx, false, false);
+        }
+        let n = val.ir().value.as_long();
+        let mut updated = items;
+        updated.insert(key.clone(), n);
+        let assoc = Expr::Assoc {
+            coll: Box::new(base),
+            key,
+            val: Box::new(val),
+            ir: Ir::new(CType::Record, Value::Record(updated.clone()), ExKind::NoEx),
+        };
+        (assoc, updated)
+    } else {
+        (base, items)
+    };
+    // Total by construction (inputs hold all fields, assoc only
+    // overwrites), so a present field always exists.
+    let present: Vec<String> = items.keys().cloned().collect();
+    let key = rng.pick(&present).clone();
+    let val = items[&key];
+    Expr::Get {
+        coll: Box::new(coll),
+        key,
+        default: None,
+        kw: rng.roll(0.5),
+        ir: Ir::long(val),
+    }
+}
+
 /// Map read. Ports the subscript policy to maps: the present key
 /// emits `get` or keyword-invoke, the absent key emits `get` with a
 /// default, and the collection sometimes passes through one `assoc`
@@ -316,8 +421,18 @@ fn gen_get(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr 
         .into_iter()
         .filter(|id| genctx.var_type(*id) == CType::Map)
         .collect();
-    if maps.is_empty() {
+    let records: Vec<VarId> = genctx
+        .all_vars()
+        .into_iter()
+        .filter(|id| genctx.var_type(*id) == CType::Record)
+        .collect();
+    if maps.is_empty() && records.is_empty() {
         return generate(rng, policy, genctx, depth, false, &None);
+    }
+    // Record reads with record_prob (share control, and a bisection
+    // knob); without map vars, records are the only game.
+    if !records.is_empty() && (maps.is_empty() || rng.roll(policy.record_prob)) {
+        return gen_record_get(rng, policy, genctx, depth, &records);
     }
     let v = *rng.pick(&maps);
     let items = match genctx.var_value(v) {
@@ -613,6 +728,25 @@ pub fn to_sexp(node: &Expr, atoms: &std::collections::BTreeSet<String>) -> Sexp 
             Sexp::sym(&format!(":{key}")),
             to_sexp(val, atoms),
         ]),
+        Expr::Record { args, map_ctor, .. } => {
+            // Args run in REC_FIELDS order, matching the declared
+            // field vector positionally.
+            if *map_ctor {
+                let mut flat = Vec::with_capacity(args.len() * 2);
+                for (f, a) in types::REC_FIELDS.iter().zip(args.iter()) {
+                    flat.push(Sexp::sym(&format!(":{f}")));
+                    flat.push(to_sexp(a, atoms));
+                }
+                Sexp::list(vec![
+                    Sexp::sym(&format!("map->{}", types::RECORD_NAME)),
+                    Sexp::map(flat),
+                ])
+            } else {
+                let mut items = vec![Sexp::sym(&format!("->{}", types::RECORD_NAME))];
+                items.extend(args.iter().map(|a| to_sexp(a, atoms)));
+                Sexp::list(items)
+            }
+        }
     }
 }
 
@@ -657,6 +791,7 @@ mod tests {
                 contains_bool(coll) || default.as_ref().is_some_and(|d| contains_bool(d))
             }
             Expr::Assoc { coll, val, .. } => contains_bool(coll) || contains_bool(val),
+            Expr::Record { args, .. } => args.iter().any(contains_bool),
         }
     }
 
@@ -690,6 +825,7 @@ mod tests {
                 all_clean(coll) && default.as_ref().is_none_or(|d| all_clean(d))
             }
             Expr::Assoc { coll, val, .. } => all_clean(coll) && all_clean(val),
+            Expr::Record { args, .. } => args.iter().all(all_clean),
         }
     }
 
@@ -730,8 +866,8 @@ mod tests {
     }
 
     fn collect_binops(node: &Expr, out: &mut Vec<BinOp>) {
-        // Subscript index trees and map value/default trees roll
-        // outside the pool; skip them.
+        // Subscript index trees and map value/default/ctor trees
+        // roll outside the pool; skip them.
         match node {
             Expr::BinOp {
                 op, left, right, ..
@@ -746,7 +882,8 @@ mod tests {
             | Expr::NthDefault { .. }
             | Expr::IdxMod { .. }
             | Expr::Get { .. }
-            | Expr::Assoc { .. } => {}
+            | Expr::Assoc { .. }
+            | Expr::Record { .. } => {}
         }
     }
 
@@ -905,6 +1042,25 @@ mod tests {
                 coll, idx, default, ..
             } => contains_get(coll) || contains_get(idx) || contains_get(default),
             Expr::IdxMod { idx, .. } => contains_get(idx),
+            Expr::Record { args, .. } => args.iter().any(contains_get),
+        }
+    }
+
+    fn contains_record(node: &Expr) -> bool {
+        match node {
+            Expr::Record { .. } => true,
+            Expr::Const(_) | Expr::Var { .. } => false,
+            Expr::UnOp { arg, .. } => contains_record(arg),
+            Expr::BinOp { left, right, .. } => contains_record(left) || contains_record(right),
+            Expr::Nth { coll, idx, .. } => contains_record(coll) || contains_record(idx),
+            Expr::NthDefault {
+                coll, idx, default, ..
+            } => contains_record(coll) || contains_record(idx) || contains_record(default),
+            Expr::IdxMod { idx, .. } => contains_record(idx),
+            Expr::Get { coll, default, .. } => {
+                contains_record(coll) || default.as_ref().is_some_and(|d| contains_record(d))
+            }
+            Expr::Assoc { coll, val, .. } => contains_record(coll) || contains_record(val),
         }
     }
 
@@ -926,5 +1082,57 @@ mod tests {
             saw_get |= contains_get(&e);
         }
         assert!(saw_get, "no map reads generated in 99 seeds");
+    }
+
+    #[test]
+    fn record_ctors_emit_positional_and_map_forms() {
+        use std::collections::BTreeSet;
+        let atoms = BTreeSet::new();
+        let args = || {
+            vec![
+                Expr::Const(Ir::long(1)),
+                Expr::Const(Ir::long(2)),
+                Expr::Const(Ir::long(3)),
+            ]
+        };
+        let pos = Expr::Record {
+            args: args(),
+            map_ctor: false,
+            ir: Ir::long(0),
+        };
+        assert_eq!(to_sexp(&pos, &atoms).flat(), "(->R0 1 2 3)");
+        let map = Expr::Record {
+            args: args(),
+            map_ctor: true,
+            ir: Ir::long(0),
+        };
+        assert_eq!(
+            to_sexp(&map, &atoms).flat(),
+            "(map->R0 {:fa 1 :fb 2 :fc 3})"
+        );
+    }
+
+    #[test]
+    fn record_reads_are_clean_across_seeds() {
+        // With a record input present, generation must actually emit
+        // fresh constructions (else this is vacuous) and every tree
+        // stays clean and bool-free.
+        let mut saw_record = false;
+        let mut saw_get = false;
+        for seed in 1..100u64 {
+            let mut rng = Rng::new(seed);
+            let policy = Policy::default();
+            let mut ctx = ctx_with_vars();
+            let r = types::random_record(&mut rng);
+            ctx.add_input("rec-0", CType::Record, r.value.clone());
+            let e = generate_safe(&mut rng, &policy, &ctx, false, Density::None);
+            assert!(e.ir().is_ok(), "seed {seed}: {:?}", e.ir());
+            assert!(all_clean(&e), "seed {seed}: faulty node under record");
+            assert!(!contains_bool(&e), "seed {seed}: bool under record");
+            saw_record |= contains_record(&e);
+            saw_get |= contains_get(&e);
+        }
+        assert!(saw_record, "no record constructions in 99 seeds");
+        assert!(saw_get, "no record reads generated in 99 seeds");
     }
 }

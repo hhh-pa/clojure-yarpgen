@@ -12,6 +12,7 @@ pub enum StructKind {
     IfElse,
     Let,
     Recur,
+    Destructure,
     Stub,
 }
 
@@ -63,6 +64,7 @@ pub struct Policy {
     pub reuse_prob: f64,
     pub nth_prob: f64,
     pub map_prob: f64,
+    pub record_prob: f64,
     pub int_types: Vec<crate::types::CType>,
     pub max_vector_len: i64,
     pub ub_allow_weight: u32,
@@ -95,6 +97,7 @@ impl Default for Policy {
                 (StructKind::IfElse, 10),
                 (StructKind::Let, 10),
                 (StructKind::Recur, 10),
+                (StructKind::Destructure, 10),
                 (StructKind::Stub, 50),
             ],
             else_branch_prob: 0.2,
@@ -110,6 +113,7 @@ impl Default for Policy {
             reuse_prob: 0.3,
             nth_prob: 0.15,
             map_prob: 0.15,
+            record_prob: 0.4,
             int_types: vec![
                 CType::Bool,
                 CType::Int,
@@ -177,8 +181,14 @@ pub fn make_policy(options: &Options, rng: &mut Rng) -> Policy {
 /// Depth-scaled loop bounds: the end range halves per nesting depth
 /// (floored at 2), so the trip-count product of deep nests stays
 /// simulable. Depth-0 loops keep the full policy range; trip counts
-/// barely matter for compiler stress, structure does.
+/// barely matter for compiler stress, structure does. One loop in ten
+/// is zero-trip (end 0): the exit test fails at entry, so the body
+/// never executes — simulation skips it exactly like the runtime, and
+/// the shrinker leaves end 0 alone (nothing cheaper to shrink to).
 pub fn loop_bounds_at_depth(rng: &mut Rng, policy: &Policy, depth: i64) -> (i64, i64, i64) {
+    if rng.roll(0.1) {
+        return (0, 0, 1);
+    }
     let shift = depth.clamp(0, 3) as u32;
     let lo = (policy.iter_end_min >> shift).max(2);
     let hi = (policy.iter_end_max >> shift).max(lo);
@@ -191,6 +201,9 @@ pub fn loop_bounds_at_depth(rng: &mut Rng, policy: &Policy, depth: i64) -> (i64,
 
 /// Depth-scaled end bound for `dotimes`.
 pub fn loop_end_at_depth(rng: &mut Rng, policy: &Policy, depth: i64) -> i64 {
+    if rng.roll(0.1) {
+        return 0;
+    }
     let shift = depth.clamp(0, 3) as u32;
     let lo = (policy.iter_end_min >> shift).max(2);
     let hi = (policy.iter_end_max >> shift).max(lo);
@@ -222,8 +235,8 @@ mod tests {
         let p = Policy::default();
         assert_eq!(p.stmt_num_limit, 1000);
         assert_eq!(p.max_arith_depth, 4);
-        // LoopSeq, LoopNest, IfElse, Let, Recur, Stub.
-        assert_eq!(p.struct_distr.len(), 6);
+        // LoopSeq, LoopNest, IfElse, Let, Recur, Destructure, Stub.
+        assert_eq!(p.struct_distr.len(), 7);
         assert_eq!(p.let_nest_limit, 5);
     }
 
@@ -264,11 +277,35 @@ mod tests {
         let mut rng = Rng::new(5);
         let policy = Policy::default();
         let (_, hi0, _) = loop_bounds_at_depth(&mut rng, &policy, 0);
-        assert!((10..=25).contains(&hi0));
+        // Either a zero-trip loop or the full depth-0 range.
+        assert!(hi0 == 0 || (10..=25).contains(&hi0), "end {hi0}");
         for _ in 0..50 {
             let (_, deep, _) = loop_bounds_at_depth(&mut rng, &policy, 4);
-            assert!((2..=3).contains(&deep), "deep end {deep} out of 2..=3");
+            assert!(
+                deep == 0 || (2..=3).contains(&deep),
+                "deep end {deep} out of 2..=3"
+            );
         }
+    }
+
+    #[test]
+    fn zero_trip_loops_occur() {
+        // The 10% zero-trip roll must actually fire (else the
+        // exit-at-entry path stays uncovered) in both bound helpers.
+        let policy = Policy::default();
+        let mut saw_bounds = false;
+        let mut saw_end = false;
+        for seed in 1..50u64 {
+            let mut rng = Rng::new(seed);
+            let (_, end, step) = loop_bounds_at_depth(&mut rng, &policy, 0);
+            saw_bounds |= end == 0;
+            if end == 0 {
+                assert_eq!(step, 1);
+            }
+            saw_end |= loop_end_at_depth(&mut rng, &policy, 0) == 0;
+        }
+        assert!(saw_bounds, "no zero-trip doseq bounds in 49 seeds");
+        assert!(saw_end, "no zero-trip dotimes end in 49 seeds");
     }
 
     #[test]

@@ -64,20 +64,32 @@ fn recur_cases() -> Vec<Case> {
     ]
 }
 
+/// Hard cap for explicit `--max-nesting` depths: past this the
+/// compiler outcome (StackOverflowError) no longer changes, and the
+/// case content just costs more to build.
+pub const MAX_NEGATIVE_DEPTH: usize = 20_000;
+
 fn nesting_cases(rng: &mut Rng, max_nesting: i64) -> Vec<Case> {
     let depth = if max_nesting > 0 {
-        max_nesting as usize
+        (max_nesting as usize).min(MAX_NEGATIVE_DEPTH)
     } else {
         rng.gen_range(2000, 8000) as usize
     };
-    let mut deep = "0".to_string();
+    // Linear builds: per-level format! reallocation is O(n^2) in depth.
+    let mut deep = String::with_capacity(depth * 7 + 1);
     for _ in 0..depth {
-        deep = format!("(+ 1 {deep})");
+        deep.push_str("(+ 1 ");
     }
+    deep.push('0');
+    deep.push_str(&")".repeat(depth));
     let ladder_n = depth.min(4000);
-    let mut ladder = "0".to_string();
+    let mut ladder = String::new();
+    for k in (0..ladder_n).rev() {
+        ladder.push_str(&format!("(let [x{k} "));
+    }
+    ladder.push('0');
     for k in 0..ladder_n {
-        ladder = format!("(let [x{k} {ladder}] x{k})");
+        ladder.push_str(&format!("] x{k})"));
     }
     vec![
         Case {
@@ -130,6 +142,10 @@ pub fn generate_cases(rng: &mut Rng, kind: NegativeKind, max_nesting: i64) -> Ve
     }
 }
 
+fn edn_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Write each case as `kebab-case-NNN.clj` plus a `manifest.edn`.
 /// Returns the written file paths.
 pub fn write_cases(out_dir: &Path, seed: u64, cases: &[Case]) -> io::Result<Vec<PathBuf>> {
@@ -148,7 +164,8 @@ pub fn write_cases(out_dir: &Path, seed: u64, cases: &[Case]) -> io::Result<Vec<
         )?;
         manifest.push_str(&format!(
             "{{:file \"{fname}\" :expected-error \"{}\" :description \"{}\"}}\n ",
-            case.expected_error, case.description
+            edn_escape(&case.expected_error),
+            edn_escape(&case.description)
         ));
         paths.push(path);
     }
@@ -186,5 +203,41 @@ mod tests {
         let mut rng = Rng::new(11);
         let cases = generate_cases(&mut rng, NegativeKind::Nesting, 50);
         assert!(cases[0].name.contains("depth-50"));
+    }
+
+    #[test]
+    fn excessive_nesting_depth_is_capped() {
+        // A huge --max-nesting must not hang the build: depth clamps
+        // and content is built in linear time.
+        let mut rng = Rng::new(11);
+        let cases = generate_cases(&mut rng, NegativeKind::Nesting, 1_000_000);
+        assert!(cases[0].name.contains("depth-20000"));
+        assert!(cases[0].content.len() < 1_000_000);
+    }
+
+    #[test]
+    fn manifest_escapes_quotes() {
+        let dir = std::env::temp_dir().join("cy-manifest-escape-test");
+        let _ = fs::remove_dir_all(&dir);
+        let cases = vec![Case {
+            name: "q".to_string(),
+            content: "(+ 1 2)".to_string(),
+            expected_error: "says \"boom\"".to_string(),
+            description: "back\\slash".to_string(),
+        }];
+        write_cases(&dir, 7, &cases).unwrap();
+        let manifest = fs::read_to_string(dir.join("manifest.edn")).unwrap();
+        assert!(manifest.contains("says \\\"boom\\\""), "{manifest}");
+        assert!(manifest.contains("back\\\\slash"), "{manifest}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nesting_ladder_nests_outside_in() {
+        // x1 binds outside x0, matching the original inside-out build.
+        let mut rng = Rng::new(11);
+        let cases = generate_cases(&mut rng, NegativeKind::Nesting, 2);
+        assert_eq!(cases[1].content, "(let [x1 (let [x0 0] x0)] x1)");
+        assert_eq!(cases[0].content, "(defn deep [] (+ 1 (+ 1 0)))");
     }
 }

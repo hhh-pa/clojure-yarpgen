@@ -13,7 +13,10 @@ use crate::types::{CType, Value};
 use std::collections::BTreeMap;
 
 /// Interned variable identity. Stable within one program across
-/// context clones; never reused after scope truncation.
+/// context clones. Ids ARE reused after scope truncation, which is
+/// sound because reuse mirrors lexical scope: an id always denotes
+/// the innermost live binding, simulation visits taken paths only,
+/// and mutation never interns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VarId(pub u32);
 
@@ -33,6 +36,7 @@ pub struct GenCtx {
     pub stmt_count: i64,
     pub loop_depth: i64,
     pub if_depth: i64,
+    pub let_depth: i64,
 }
 
 impl GenCtx {
@@ -47,6 +51,7 @@ impl GenCtx {
             stmt_count: 0,
             loop_depth: 0,
             if_depth: 0,
+            let_depth: 0,
         }
     }
 
@@ -77,8 +82,9 @@ impl GenCtx {
         id
     }
 
-    /// Bind a loop-local. Rebinding an existing name (every loop
-    /// iteration during simulation) updates in place.
+    /// Bind a local (loop variable or `let` binding). Rebinding an
+    /// existing name (every loop iteration during simulation)
+    /// updates in place.
     pub fn add_local(&mut self, name: &str, typ: CType, value: Value) -> VarId {
         self.intern(name, typ, value)
     }
@@ -116,10 +122,18 @@ impl GenCtx {
     }
 
     /// Variables that assignment may target: external outputs only.
-    /// Locals are `doseq`-bound loop variables (plain values, not atoms)
-    /// and must never be `reset!`.
+    /// Locals (loop variables, `let` bindings) are plain values, not
+    /// atoms, and must never be `reset!`.
     pub fn writable_vars(&self) -> Vec<VarId> {
         self.outputs.clone()
+    }
+
+    /// Output names, for atom rendering when measuring statements.
+    pub fn output_names(&self) -> Vec<String> {
+        self.outputs
+            .iter()
+            .map(|id| self.names[id.0 as usize].clone())
+            .collect()
     }
 
     /// Derive a branch context: `taken && flag`.
@@ -129,8 +143,8 @@ impl GenCtx {
         c
     }
 
-    /// Drop everything interned after `other`'s snapshot: loop
-    /// variables leaving scope. Outputs predate all locals and survive.
+    /// Drop everything interned after `other`'s snapshot: locals
+    /// leaving scope. Outputs predate all locals and survive.
     pub fn restore_scope_from(&mut self, other: &Self) {
         self.truncate_to(other.names.len());
         self.outputs.truncate(other.outputs.len());

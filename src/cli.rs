@@ -124,8 +124,8 @@ pub fn usage() -> &'static str {
      \x20 --mutation-seed N       mutation seed (0 = random, default 0)\n\
      \x20 --allow-exc-in-dead none|some|all\n\
      \x20                         allow exceptions in dead branches (default none)\n\
-     \x20 --max-array-dims N      vector-length cap (0 = default 8)\n\
-     \x20 --max-nesting N         nesting guard (0 = default 64)\n\
+     \x20 --max-array-dims N      vector length (0 = default 8, capped at 65536)\n\
+     \x20 --max-nesting N         loop/if depth cap, negative-suite depth (0 = defaults)\n\
      \x20 --simple-loops none|some|all\n\
      \x20                         analyzer-friendly profile (default none)\n\
      \x20 --unchecked-math on|off compile test-fn unchecked (default off)\n\

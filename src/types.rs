@@ -6,6 +6,7 @@
 
 use crate::policy::Policy;
 use crate::rng::Rng;
+use std::collections::BTreeMap;
 
 /// Exception kinds. Port of the reachable subset of YARPGen's `UBKind`
 /// enum. The Clojure subset needs no shift/cast/recur faults: shift
@@ -32,6 +33,7 @@ pub enum CType {
     Long,
     ULong,
     Vec,
+    Map,
 }
 
 impl CType {
@@ -43,11 +45,12 @@ impl CType {
             CType::Long => (i64::MIN, i64::MAX),
             CType::ULong => (0, i64::MAX),
             CType::Vec => (0, 0),
+            CType::Map => (0, 0),
         }
     }
 
     pub fn is_scalar(self) -> bool {
-        !matches!(self, CType::Vec | CType::Bool)
+        !matches!(self, CType::Vec | CType::Bool | CType::Map)
     }
 }
 
@@ -56,6 +59,7 @@ pub enum Value {
     Long(i64),
     Bool(bool),
     Vec(Vec<i64>),
+    Map(BTreeMap<String, i64>),
 }
 
 impl Value {
@@ -64,6 +68,7 @@ impl Value {
             Value::Long(n) => *n,
             Value::Bool(b) => i64::from(*b),
             Value::Vec(v) => v.len() as i64,
+            Value::Map(m) => m.len() as i64,
         }
     }
 }
@@ -139,7 +144,10 @@ pub fn sdiv(a: &Ir, b: &Ir) -> Ir {
     if y == 0 {
         Ir::new(CType::Long, Value::Long(0), ExKind::ZeroDiv)
     } else if x == i64::MIN && y == -1 {
-        Ir::ovf()
+        // Probed: JVM idiv only throws on /0, so MIN/-1 wraps to MIN
+        // (JLS 15.17.2) instead of faulting. Rust would panic here,
+        // hence the explicit arm.
+        Ir::long(i64::MIN)
     } else {
         Ir::long(x / y)
     }
@@ -150,7 +158,7 @@ pub fn smod(a: &Ir, b: &Ir) -> Ir {
     if y == 0 {
         Ir::new(CType::Long, Value::Long(0), ExKind::ZeroDiv)
     } else if x == i64::MIN && y == -1 {
-        // Unlike quot, rem cannot overflow: MIN % -1 == 0, no throw.
+        // Like quot, rem cannot overflow: MIN % -1 == 0, no throw.
         Ir::long(0)
     } else {
         Ir::long(x % y)
@@ -438,12 +446,35 @@ pub fn random_vec(rng: &mut Rng, policy: &Policy) -> Ir {
     )
 }
 
+/// Shared keyword vocabulary (without the `:`) for map inputs. All
+/// maps draw keys from this set, so every key is present in some map
+/// and absent in others: reads roll present keys (plain `get` or
+/// keyword-invoke) and absent keys (`get` with a default).
+pub const MAP_KEYS: [&str; 4] = ["ka", "kb", "kc", "kd"];
+
+/// Random small map constant: 2-4 vocabulary keys with small values.
+pub fn random_map(rng: &mut Rng) -> Ir {
+    let mut keys = MAP_KEYS.to_vec();
+    // Fisher-Yates prefix: take a random-sized random subset.
+    for i in (1..keys.len()).rev() {
+        let j = rng.gen_usize(i + 1);
+        keys.swap(i, j);
+    }
+    let n = rng.gen_range(2, MAP_KEYS.len() as i64) as usize;
+    let map: BTreeMap<String, i64> = keys[..n]
+        .iter()
+        .map(|k| (k.to_string(), rng.gen_range(-100, 100)))
+        .collect();
+    Ir::new(CType::Map, Value::Map(map), ExKind::NoEx)
+}
+
 /// Clojure truthiness for branch conditions: only `false` and `nil`
 /// are falsey. Note `0` and `[]` are truthy, unlike in C.
 pub fn coerce_bool(v: &Ir) -> bool {
     match &v.value {
         Value::Bool(b) => *b,
-        Value::Long(_) | Value::Vec(_) => true,
+        // Probed: even `{}` is truthy.
+        Value::Long(_) | Value::Vec(_) | Value::Map(_) => true,
     }
 }
 
@@ -464,10 +495,6 @@ mod tests {
     fn div_by_zero_flagged() {
         assert_eq!(sdiv(&Ir::long(1), &Ir::long(0)).ex, ExKind::ZeroDiv);
         assert_eq!(smod(&Ir::long(1), &Ir::long(0)).ex, ExKind::ZeroDiv);
-        assert_eq!(
-            sdiv(&Ir::long(i64::MIN), &Ir::long(-1)).ex,
-            ExKind::ArithOvf
-        );
     }
 
     #[test]
@@ -496,15 +523,20 @@ mod tests {
     }
 
     #[test]
+    fn quot_min_by_neg_one_wraps() {
+        // Probed on Clojure 1.12.0 and 1.12.6: JVM idiv only throws
+        // on /0 (JLS 15.17.2); MIN/-1 wraps to MIN as a Long.
+        let q = sdiv(&Ir::long(i64::MIN), &Ir::long(-1));
+        assert_eq!(q.ex, ExKind::NoEx);
+        assert_eq!(q.value, Value::Long(i64::MIN));
+    }
+
+    #[test]
     fn rem_min_by_neg_one_is_zero() {
         assert_eq!(
             smod(&Ir::long(i64::MIN), &Ir::long(-1)),
             Ir::long(0),
-            "rem cannot overflow, unlike quot"
-        );
-        assert_eq!(
-            sdiv(&Ir::long(i64::MIN), &Ir::long(-1)).ex,
-            ExKind::ArithOvf
+            "rem of MIN by -1 is 0"
         );
     }
 
@@ -579,5 +611,33 @@ mod tests {
                 assert!((lo..=hi).contains(&v), "{t:?} const {v} out of range");
             }
         }
+    }
+
+    #[test]
+    fn random_map_draws_vocab_keys() {
+        // 2-4 vocabulary keys with small values, never empty.
+        for seed in 1..50u64 {
+            let mut rng = Rng::new(seed);
+            let m = random_map(&mut rng);
+            assert_eq!(m.typ, CType::Map);
+            assert!(m.is_ok());
+            match &m.value {
+                Value::Map(items) => {
+                    assert!((2..=MAP_KEYS.len()).contains(&items.len()));
+                    for (k, v) in items {
+                        assert!(MAP_KEYS.contains(&k.as_str()), "key {k} off-vocabulary");
+                        assert!((-100..=100).contains(v));
+                    }
+                }
+                other => panic!("expected map value, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn maps_are_not_scalar_but_truthy() {
+        assert!(!CType::Map.is_scalar());
+        let m = Ir::new(CType::Map, Value::Map(BTreeMap::new()), ExKind::NoEx);
+        assert!(coerce_bool(&m));
     }
 }

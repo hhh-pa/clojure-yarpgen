@@ -50,6 +50,26 @@ pub enum Expr {
         len: i64,
         ir: Ir,
     },
+    /// Map read. Present keys emit `(get coll :k)` or the
+    /// keyword-invoke form `(:k coll)` (same value, different
+    /// codegen); absent keys emit `(get coll :k default)`. A bare
+    /// miss returns nil, which the model cannot represent, so
+    /// absent keys always carry a default.
+    Get {
+        coll: Box<Expr>,
+        key: String,
+        default: Option<Box<Expr>>,
+        kw: bool,
+        ir: Ir,
+    },
+    /// One persistent update. Emits `(assoc coll :k val)`; the IR is
+    /// the whole updated map.
+    Assoc {
+        coll: Box<Expr>,
+        key: String,
+        val: Box<Expr>,
+        ir: Ir,
+    },
 }
 
 impl Expr {
@@ -62,6 +82,8 @@ impl Expr {
             Expr::Nth { ir, .. } => ir,
             Expr::NthDefault { ir, .. } => ir,
             Expr::IdxMod { ir, .. } => ir,
+            Expr::Get { ir, .. } => ir,
+            Expr::Assoc { ir, .. } => ir,
         }
     }
 }
@@ -185,10 +207,11 @@ fn gen_binary(
             *rng.pick(p)
         } else {
             // A compare pool must not leak booleans into scalar
-            // positions; fall back to scalar operators instead.
+            // positions; fall back to one fixed scalar family so
+            // similarity still holds.
             let scalars: Vec<BinOp> = p.iter().copied().filter(|o| !o.is_compare()).collect();
             if scalars.is_empty() {
-                *rng.pick(BinOp::scalar())
+                *rng.pick(&[BinOp::Add, BinOp::Sub])
             } else {
                 *rng.pick(&scalars)
             }
@@ -198,8 +221,11 @@ fn gen_binary(
     } else {
         *rng.pick(BinOp::scalar())
     };
-    let left = generate(rng, policy, genctx, depth + 1, false, &None);
-    let right = generate(rng, policy, genctx, depth + 1, false, &None);
+    // The pool propagates to the whole subtree (subscript index
+    // and map value/default trees excepted: gen_nth/gen_get roll
+    // those separately).
+    let left = generate(rng, policy, genctx, depth + 1, false, pool);
+    let right = generate(rng, policy, genctx, depth + 1, false, pool);
     let ir = types::eval_binop(op, left.ir(), right.ir());
     Expr::BinOp {
         op,
@@ -278,6 +304,85 @@ fn gen_nth(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr 
     }
 }
 
+/// Map read. Ports the subscript policy to maps: the present key
+/// emits `get` or keyword-invoke, the absent key emits `get` with a
+/// default, and the collection sometimes passes through one `assoc`
+/// first (persistent-update codegen on the read path). Clean by
+/// construction: every argument always evaluates, so faulty
+/// subtrees are replaced with leaves, never masked.
+fn gen_get(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr {
+    let maps: Vec<VarId> = genctx
+        .all_vars()
+        .into_iter()
+        .filter(|id| genctx.var_type(*id) == CType::Map)
+        .collect();
+    if maps.is_empty() {
+        return generate(rng, policy, genctx, depth, false, &None);
+    }
+    let v = *rng.pick(&maps);
+    let items = match genctx.var_value(v) {
+        Value::Map(items) => items.clone(),
+        _ => return Expr::Const(types::random_const(rng, policy, CType::Long)),
+    };
+    let base = Expr::Var {
+        id: v,
+        name: genctx.var_name(v).to_string(),
+        ir: Ir::new(CType::Map, Value::Map(items.clone()), ExKind::NoEx),
+    };
+    let (coll, items) = if rng.roll(0.3) {
+        let key = (*rng.pick(&types::MAP_KEYS)).to_string();
+        let mut val = generate(rng, policy, genctx, depth + 1, false, &None);
+        if !val.ir().is_ok() {
+            val = leaf(rng, policy, genctx, false, false);
+        }
+        let n = val.ir().value.as_long();
+        let mut updated = items;
+        updated.insert(key.clone(), n);
+        let assoc = Expr::Assoc {
+            coll: Box::new(base),
+            key,
+            val: Box::new(val),
+            ir: Ir::new(CType::Map, Value::Map(updated.clone()), ExKind::NoEx),
+        };
+        (assoc, updated)
+    } else {
+        (base, items)
+    };
+    let absent: Vec<&str> = types::MAP_KEYS
+        .iter()
+        .copied()
+        .filter(|k| !items.contains_key(*k))
+        .collect();
+    if !absent.is_empty() && rng.roll(0.3) {
+        let key = (*rng.pick(&absent)).to_string();
+        let mut default = generate(rng, policy, genctx, depth + 1, false, &None);
+        if !default.ir().is_ok() {
+            default = leaf(rng, policy, genctx, false, false);
+        }
+        let ir = default.ir().clone();
+        Expr::Get {
+            coll: Box::new(coll),
+            key,
+            default: Some(Box::new(default)),
+            kw: false,
+            ir,
+        }
+    } else {
+        // Map inputs always hold 2-4 keys and assoc only adds, so a
+        // present key always exists.
+        let present: Vec<String> = items.keys().cloned().collect();
+        let key = rng.pick(&present).clone();
+        let val = items[&key];
+        Expr::Get {
+            coll: Box::new(coll),
+            key,
+            default: None,
+            kw: rng.roll(0.5),
+            ir: Ir::long(val),
+        }
+    }
+}
+
 /// Generate a random expression AST of at most `max_arith_depth`.
 pub fn generate(
     rng: &mut Rng,
@@ -287,14 +392,18 @@ pub fn generate(
     want_bool: bool,
     pool: &Option<Vec<BinOp>>,
 ) -> Expr {
+    // A pooled top-level leaf is a constant; below the top, pooled
+    // subtrees may reference variables (the pool constrains operator
+    // choice, not leaf kind).
+    let top_const = pool.is_some() && depth == 0;
     if depth >= policy.max_arith_depth {
-        return leaf(rng, policy, genctx, want_bool, pool.is_some());
+        return leaf(rng, policy, genctx, want_bool, top_const);
     }
     match rng.pick_weighted(&policy.node_distr) {
-        NodeKind::Leaf => leaf(rng, policy, genctx, want_bool, pool.is_some()),
+        NodeKind::Leaf => leaf(rng, policy, genctx, want_bool, top_const),
         NodeKind::Unary => {
             if want_bool {
-                leaf(rng, policy, genctx, want_bool, pool.is_some())
+                leaf(rng, policy, genctx, want_bool, top_const)
             } else {
                 gen_unary(rng, policy, genctx, depth, pool)
             }
@@ -302,6 +411,8 @@ pub fn generate(
         NodeKind::Binary => {
             if !want_bool && rng.roll(policy.nth_prob) {
                 gen_nth(rng, policy, genctx, depth)
+            } else if !want_bool && rng.roll(policy.map_prob) {
+                gen_get(rng, policy, genctx, depth)
             } else {
                 gen_binary(rng, policy, genctx, depth, want_bool, pool)
             }
@@ -358,7 +469,7 @@ fn re_eval(expr: Expr) -> Expr {
 }
 
 /// Single rebuild step: swap the operator, else the caller regenerates.
-fn rebuild_node(rng: &mut Rng, policy: &Policy, node: Expr) -> Expr {
+fn rebuild_node(node: Expr) -> Expr {
     match node {
         Expr::BinOp {
             op,
@@ -378,19 +489,13 @@ fn rebuild_node(rng: &mut Rng, policy: &Policy, node: Expr) -> Expr {
             let op = rebuild_unop(op, ir.ex);
             re_eval(Expr::UnOp { op, arg, ir })
         }
-        // Belt and braces: gen_nth builds clean tops by construction,
-        // so a faulty Nth only arrives via a faulty index, for which a
-        // default is sound exactly when the index is int-ranged (the
-        // common OOB case). Out-of-int-range indices cannot occur here.
-        Expr::Nth { coll, idx, .. } => {
-            let d = types::random_const(rng, policy, CType::Long);
-            Expr::NthDefault {
-                coll,
-                idx,
-                default: Box::new(Expr::Const(d.clone())),
-                ir: d,
-            }
-        }
+        // Unreachable in practice: gen_nth replaces faulty indices
+        // with clean leaves, so Nth tops are clean by construction and
+        // only BinOp/UnOp nodes arrive here faulty. Pass through
+        // unchanged (the caller regenerates) rather than converting
+        // to a default, which would be unsound for out-of-int-range
+        // indices: Clojure narrows via toIntExact in both arities.
+        Expr::Nth { coll, idx, ir } => Expr::Nth { coll, idx, ir },
         other => other,
     }
 }
@@ -419,7 +524,7 @@ pub fn generate_safe(
         if allow {
             return node;
         }
-        node = rebuild_node(rng, policy, node);
+        node = rebuild_node(node);
         if node.ir().is_ok() {
             return node;
         }
@@ -481,6 +586,33 @@ pub fn to_sexp(node: &Expr, atoms: &std::collections::BTreeSet<String>) -> Sexp 
         Expr::IdxMod { idx, len, .. } => {
             Sexp::list(vec![Sexp::sym("mod"), to_sexp(idx, atoms), Sexp::int(*len)])
         }
+        Expr::Get {
+            coll,
+            key,
+            default,
+            kw,
+            ..
+        } => {
+            let k = Sexp::sym(&format!(":{key}"));
+            if *kw {
+                Sexp::list(vec![k, to_sexp(coll, atoms)])
+            } else if let Some(d) = default {
+                Sexp::list(vec![
+                    Sexp::sym("get"),
+                    to_sexp(coll, atoms),
+                    k,
+                    to_sexp(d, atoms),
+                ])
+            } else {
+                Sexp::list(vec![Sexp::sym("get"), to_sexp(coll, atoms), k])
+            }
+        }
+        Expr::Assoc { coll, key, val, .. } => Sexp::list(vec![
+            Sexp::sym("assoc"),
+            to_sexp(coll, atoms),
+            Sexp::sym(&format!(":{key}")),
+            to_sexp(val, atoms),
+        ]),
     }
 }
 
@@ -521,6 +653,10 @@ mod tests {
                 coll, idx, default, ..
             } => contains_bool(coll) || contains_bool(idx) || contains_bool(default),
             Expr::IdxMod { idx, .. } => contains_bool(idx),
+            Expr::Get { coll, default, .. } => {
+                contains_bool(coll) || default.as_ref().is_some_and(|d| contains_bool(d))
+            }
+            Expr::Assoc { coll, val, .. } => contains_bool(coll) || contains_bool(val),
         }
     }
 
@@ -550,6 +686,10 @@ mod tests {
                 coll, idx, default, ..
             } => all_clean(coll) && all_clean(idx) && all_clean(default),
             Expr::IdxMod { idx, .. } => all_clean(idx),
+            Expr::Get { coll, default, .. } => {
+                all_clean(coll) && default.as_ref().is_none_or(|d| all_clean(d))
+            }
+            Expr::Assoc { coll, val, .. } => all_clean(coll) && all_clean(val),
         }
     }
 
@@ -566,6 +706,109 @@ mod tests {
                 assert!(all_clean(&e), "seed {seed} bool={want_bool}: faulty node");
             }
         }
+    }
+
+    #[test]
+    fn rebuild_passes_nth_through_unchanged() {
+        // gen_nth tops are clean by construction, so rebuild never
+        // sees a faulty Nth; if it ever does, passthrough (the caller
+        // regenerates) is the sound answer, since a default would not
+        // save an out-of-int-range index.
+        let nth = Expr::Nth {
+            coll: Box::new(Expr::Const(Ir::new(
+                CType::Vec,
+                Value::Vec(vec![1]),
+                ExKind::NoEx,
+            ))),
+            idx: Box::new(Expr::Const(Ir::long(1 << 40))),
+            ir: Ir::new(CType::Long, Value::Long(0), ExKind::Oob),
+        };
+        match rebuild_node(nth) {
+            Expr::Nth { ir, .. } => assert_eq!(ir.ex, ExKind::Oob),
+            other => panic!("rebuild must not convert Nth, got {other:?}"),
+        }
+    }
+
+    fn collect_binops(node: &Expr, out: &mut Vec<BinOp>) {
+        // Subscript index trees and map value/default trees roll
+        // outside the pool; skip them.
+        match node {
+            Expr::BinOp {
+                op, left, right, ..
+            } => {
+                out.push(*op);
+                collect_binops(left, out);
+                collect_binops(right, out);
+            }
+            Expr::UnOp { arg, .. } => collect_binops(arg, out),
+            Expr::Const(_) | Expr::Var { .. } => {}
+            Expr::Nth { .. }
+            | Expr::NthDefault { .. }
+            | Expr::IdxMod { .. }
+            | Expr::Get { .. }
+            | Expr::Assoc { .. } => {}
+        }
+    }
+
+    #[test]
+    fn similar_pool_restricts_whole_subtree() {
+        // A similar-operators pool restricts operator choice in the
+        // whole subtree (subscript index trees excepted). Compare
+        // pools in scalar positions fall back to Add/Sub so no
+        // boolean leaks into arithmetic. Tested on generate directly:
+        // post-hoc rebuild swaps may legitimately leave the family.
+        let policy = Policy::default();
+        let mut saw_ops = false;
+        for seed in 1..20u64 {
+            let mut rng = Rng::new(seed);
+            let mut ctx = ctx_with_vars();
+            // Without a vector/map, gen_nth/gen_get take their
+            // unpooled fallback paths; the real paths roll index and
+            // value trees outside the pool (skipped by the
+            // collector) instead.
+            ctx.add_input("v-0", CType::Vec, Value::Vec(vec![7, -2, 5]));
+            ctx.add_input(
+                "m-0",
+                CType::Map,
+                Value::Map(
+                    [("ka".to_string(), 7), ("kb".to_string(), -2)]
+                        .into_iter()
+                        .collect(),
+                ),
+            );
+            for fam in types::op_families() {
+                let compares_only = fam.iter().all(|o| o.is_compare());
+                let pool = Some(fam.clone());
+                // Scalar tree: pool family, or Add/Sub for a compare pool.
+                let e = generate(&mut rng, &policy, &ctx, 0, false, &pool);
+                let mut ops = Vec::new();
+                collect_binops(&e, &mut ops);
+                saw_ops |= !ops.is_empty();
+                let allowed: Vec<BinOp> = if compares_only {
+                    vec![BinOp::Add, BinOp::Sub]
+                } else {
+                    fam.clone()
+                };
+                assert!(
+                    ops.iter().all(|o| allowed.contains(o)),
+                    "seed {seed} scalar: {ops:?} escapes {allowed:?}"
+                );
+                // Boolean tree: top compare with scalar Add/Sub below
+                // for a compare pool, else the pool family throughout.
+                let e = generate(&mut rng, &policy, &ctx, 0, true, &pool);
+                let mut ops = Vec::new();
+                collect_binops(&e, &mut ops);
+                saw_ops |= !ops.is_empty();
+                let ok = if compares_only {
+                    ops.iter()
+                        .all(|o| o.is_compare() || *o == BinOp::Add || *o == BinOp::Sub)
+                } else {
+                    ops.iter().all(|o| fam.contains(o))
+                };
+                assert!(ok, "seed {seed} bool: {ops:?} escapes pool");
+            }
+        }
+        assert!(saw_ops, "no binops generated at all");
     }
 
     #[test]
@@ -597,5 +840,91 @@ mod tests {
             ir: Ir::long(1),
         };
         assert_eq!(to_sexp(&f, &atoms).flat(), "in-0");
+    }
+
+    fn map_var(ctx: &GenCtx) -> Expr {
+        let id = ctx.id_of("map-0").unwrap();
+        Expr::Var {
+            id,
+            name: "map-0".to_string(),
+            ir: Ir::new(CType::Map, ctx.var_value(id).clone(), ExKind::NoEx),
+        }
+    }
+
+    #[test]
+    fn map_forms_emit_get_invoke_default_and_assoc() {
+        use std::collections::BTreeMap;
+        use std::collections::BTreeSet;
+        let atoms = BTreeSet::new();
+        let mut ctx = ctx_with_vars();
+        let items: BTreeMap<String, i64> = [("ka".to_string(), 1), ("kb".to_string(), 2)]
+            .into_iter()
+            .collect();
+        ctx.add_input("map-0", CType::Map, Value::Map(items));
+        let get = Expr::Get {
+            coll: Box::new(map_var(&ctx)),
+            key: "ka".to_string(),
+            default: None,
+            kw: false,
+            ir: Ir::long(1),
+        };
+        assert_eq!(to_sexp(&get, &atoms).flat(), "(get map-0 :ka)");
+        let kw = Expr::Get {
+            coll: Box::new(map_var(&ctx)),
+            key: "kb".to_string(),
+            default: None,
+            kw: true,
+            ir: Ir::long(2),
+        };
+        assert_eq!(to_sexp(&kw, &atoms).flat(), "(:kb map-0)");
+        let miss = Expr::Get {
+            coll: Box::new(map_var(&ctx)),
+            key: "kc".to_string(),
+            default: Some(Box::new(Expr::Const(Ir::long(9)))),
+            kw: false,
+            ir: Ir::long(9),
+        };
+        assert_eq!(to_sexp(&miss, &atoms).flat(), "(get map-0 :kc 9)");
+        let assoc = Expr::Assoc {
+            coll: Box::new(map_var(&ctx)),
+            key: "kc".to_string(),
+            val: Box::new(Expr::Const(Ir::long(7))),
+            ir: Ir::new(CType::Map, Value::Map(BTreeMap::new()), ExKind::NoEx),
+        };
+        assert_eq!(to_sexp(&assoc, &atoms).flat(), "(assoc map-0 :kc 7)");
+    }
+
+    fn contains_get(node: &Expr) -> bool {
+        match node {
+            Expr::Get { .. } | Expr::Assoc { .. } => true,
+            Expr::Const(_) | Expr::Var { .. } => false,
+            Expr::UnOp { arg, .. } => contains_get(arg),
+            Expr::BinOp { left, right, .. } => contains_get(left) || contains_get(right),
+            Expr::Nth { coll, idx, .. } => contains_get(coll) || contains_get(idx),
+            Expr::NthDefault {
+                coll, idx, default, ..
+            } => contains_get(coll) || contains_get(idx) || contains_get(default),
+            Expr::IdxMod { idx, .. } => contains_get(idx),
+        }
+    }
+
+    #[test]
+    fn map_reads_are_clean_across_seeds() {
+        // With map inputs present, generation must actually emit
+        // reads (else this is vacuous) and every tree stays clean.
+        let mut saw_get = false;
+        for seed in 1..100u64 {
+            let mut rng = Rng::new(seed);
+            let policy = Policy::default();
+            let mut ctx = ctx_with_vars();
+            let m = types::random_map(&mut rng);
+            ctx.add_input("map-0", CType::Map, m.value.clone());
+            let e = generate_safe(&mut rng, &policy, &ctx, false, Density::None);
+            assert!(e.ir().is_ok(), "seed {seed}: {:?}", e.ir());
+            assert!(all_clean(&e), "seed {seed}: faulty node under Get");
+            assert!(!contains_bool(&e), "seed {seed}: bool under Get");
+            saw_get |= contains_get(&e);
+        }
+        assert!(saw_get, "no map reads generated in 99 seeds");
     }
 }

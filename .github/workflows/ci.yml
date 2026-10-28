@@ -29,6 +29,10 @@ jobs:
           curl -sSL -O https://repo1.maven.org/maven2/org/clojure/clojure/1.12.0/clojure-1.12.0.jar
           curl -sSL -O https://repo1.maven.org/maven2/org/clojure/spec.alpha/0.5.238/spec.alpha-0.5.238.jar
           curl -sSL -O https://repo1.maven.org/maven2/org/clojure/core.specs.alpha/0.4.74/core.specs.alpha-0.4.74.jar
+      - name: Install Babashka
+        uses: turtlequeue/setup-babashka@v1.7.0
+        with:
+          babashka-version: 1.13.229
       - name: Fuzz end-to-end
         env:
           CLOJURE_CP: /tmp/clj-cp/clojure-1.12.0.jar:/tmp/clj-cp/spec.alpha-0.5.238.jar:/tmp/clj-cp/core.specs.alpha-0.4.74.jar

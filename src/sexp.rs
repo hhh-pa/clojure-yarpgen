@@ -35,6 +35,13 @@ impl Sexp {
         v.extend(items);
         Sexp::List(v)
     }
+    /// `{k v ...}` prints as a map; alternating keys and values with
+    /// a marker, mirroring [`Sexp::vec`].
+    pub fn map(items: Vec<Sexp>) -> Self {
+        let mut v = vec![Sexp::Sym("__map__".to_string())];
+        v.extend(items);
+        Sexp::List(v)
+    }
 
     /// Compact one-line rendering.
     pub fn flat(&self) -> String {
@@ -48,6 +55,9 @@ impl Sexp {
                 if items.first() == Some(&Sexp::Sym("__vec__".to_string())) {
                     let inner: Vec<String> = items[1..].iter().map(|x| x.flat()).collect();
                     format!("[{}]", inner.join(" "))
+                } else if items.first() == Some(&Sexp::Sym("__map__".to_string())) {
+                    let inner: Vec<String> = items[1..].iter().map(|x| x.flat()).collect();
+                    format!("{{{}}}", inner.join(" "))
                 } else {
                     let inner: Vec<String> = items.iter().map(|x| x.flat()).collect();
                     format!("({})", inner.join(" "))
@@ -71,8 +81,11 @@ impl Sexp {
                     return format!("{pad}{flat}");
                 }
                 let is_vec = items.first() == Some(&Sexp::Sym("__vec__".to_string()));
+                let is_map = items.first() == Some(&Sexp::Sym("__map__".to_string()));
                 let (open, close, elems) = if is_vec {
                     ("[", "]", &items[1..])
+                } else if is_map {
+                    ("{", "}", &items[1..])
                 } else {
                     ("(", ")", &items[..])
                 };
@@ -107,6 +120,17 @@ mod tests {
     fn vec_prints_with_brackets() {
         let v = Sexp::vec(vec![Sexp::int(1), Sexp::int(2)]);
         assert_eq!(v.flat(), "[1 2]");
+    }
+
+    #[test]
+    fn map_prints_with_braces() {
+        let m = Sexp::map(vec![
+            Sexp::sym(":ka"),
+            Sexp::int(1),
+            Sexp::sym(":kb"),
+            Sexp::int(2),
+        ]);
+        assert_eq!(m.flat(), "{:ka 1 :kb 2}");
     }
 
     #[test]

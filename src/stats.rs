@@ -65,6 +65,18 @@ fn walk_expr(e: &Expr, counts: &mut BTreeMap<String, i64>) {
             bump(counts, "index-wraps");
             walk_expr(idx, counts);
         }
+        Expr::Get { coll, default, .. } => {
+            bump(counts, "map-gets");
+            walk_expr(coll, counts);
+            if let Some(d) = default {
+                walk_expr(d, counts);
+            }
+        }
+        Expr::Assoc { coll, val, .. } => {
+            bump(counts, "map-assocs");
+            walk_expr(coll, counts);
+            walk_expr(val, counts);
+        }
     }
 }
 
@@ -100,6 +112,26 @@ fn walk_stmt(s: &Stmt, counts: &mut BTreeMap<String, i64>, depth: i64) {
                 walk_stmt(b, counts, depth + 1);
             }
         }
+        Stmt::Let { bindings, body } => {
+            bump(counts, "lets");
+            for (_, rhs) in bindings {
+                walk_expr(rhs, counts);
+            }
+            for b in body {
+                walk_stmt(b, counts, depth + 1);
+            }
+        }
+        Stmt::Recur { accs, body, .. } => {
+            bump(counts, "loops");
+            bump(counts, "recur");
+            for (_, init, update) in accs {
+                walk_expr(init, counts);
+                walk_expr(update, counts);
+            }
+            for b in body {
+                walk_stmt(b, counts, depth + 1);
+            }
+        }
     }
 }
 
@@ -117,6 +149,17 @@ pub fn stmt_cost(s: &Stmt) -> u64 {
         }
         Stmt::Loop { body, .. } => 8 + body.iter().map(stmt_cost).sum::<u64>(),
         Stmt::Dotimes { body, .. } => 8 + body.iter().map(stmt_cost).sum::<u64>(),
+        Stmt::Let { bindings, body } => {
+            2 + bindings.iter().map(|(_, e)| expr_cost(e)).sum::<u64>()
+                + body.iter().map(stmt_cost).sum::<u64>()
+        }
+        Stmt::Recur { accs, body, .. } => {
+            8 + accs
+                .iter()
+                .map(|(_, i, u)| expr_cost(i) + expr_cost(u))
+                .sum::<u64>()
+                + body.iter().map(stmt_cost).sum::<u64>()
+        }
     }
 }
 
@@ -130,5 +173,9 @@ pub fn expr_cost(e: &Expr) -> u64 {
             coll, idx, default, ..
         } => expr_cost(coll) + expr_cost(idx) + expr_cost(default),
         Expr::IdxMod { idx, .. } => expr_cost(idx),
+        Expr::Get { coll, default, .. } => {
+            expr_cost(coll) + default.as_ref().map_or(0, |d| expr_cost(d))
+        }
+        Expr::Assoc { coll, val, .. } => expr_cost(coll) + expr_cost(val),
     }
 }

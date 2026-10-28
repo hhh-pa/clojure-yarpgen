@@ -17,7 +17,7 @@ mod stats;
 mod stmt;
 mod types;
 
-use cli::{MutateMode, NegativeKind, Options};
+use cli::{MutateMode, NegativeKind, Options, Std};
 use context::GenCtx;
 use emitter::{Input, Output, Program};
 use policy::Policy;
@@ -51,6 +51,15 @@ fn generate_program(seed: u64, options: &Options, policy: &Policy, rng: &mut Rng
             value: v.value,
         });
     }
+    for i in 0..2 {
+        let m = types::random_map(rng);
+        genctx.add_input(&format!("map-{i}"), CType::Map, m.value.clone());
+        inputs.push(Input {
+            name: format!("map-{i}"),
+            typ: CType::Map,
+            value: m.value,
+        });
+    }
     let mut outputs = Vec::new();
     for i in 0..n_scalars {
         let c = types::random_const(rng, policy, CType::Long);
@@ -63,25 +72,10 @@ fn generate_program(seed: u64, options: &Options, policy: &Policy, rng: &mut Rng
         });
     }
     // Every top-level statement must fit in one emitted function;
-    // repopulate on oversized statements, with a size-guaranteed
-    // straight-line scope as the final fallback.
-    let (final_ctx, stmts) = {
-        let mut result = None;
-        for _ in 0..3 {
-            let (ctx, stmts) =
-                stmt::populate_scope(rng, policy, genctx.clone(), options.allow_exc_in_dead, 0);
-            if stmts
-                .iter()
-                .all(|s| stats::stmt_cost(s) <= emitter::MAX_STMT_COST)
-            {
-                result = Some((ctx, stmts));
-                break;
-            }
-        }
-        result.unwrap_or_else(|| {
-            stmt::populate_stub_scope(rng, policy, genctx, options.allow_exc_in_dead, 0)
-        })
-    };
+    // oversized units are repaired per statement so one big loop nest
+    // can't nuke the whole scope's control-flow diversity.
+    let (final_ctx, stmts) =
+        stmt::populate_top_scope(rng, policy, genctx, options.allow_exc_in_dead);
     for o in outputs.iter_mut() {
         o.final_value = final_ctx
             .lookup(&o.name)
@@ -135,6 +129,9 @@ fn generate_to_dir(options: &Options, seed: u64, dir: &std::path::Path) -> Optio
 
 fn run_generate(options: &Options) -> ExitCode {
     if options.negative != NegativeKind::None {
+        if options.count != 1 {
+            eprintln!("warning: --count is ignored with --negative (one suite)");
+        }
         let mut rng = Rng::new(options.seed);
         let seed = rng.seed();
         let cases = negative::generate_cases(&mut rng, options.negative, options.max_nesting);
@@ -183,21 +180,69 @@ fn run_generate(options: &Options) -> ExitCode {
     }
 }
 
+/// Options fuzz cannot serve, with the user-facing reason.
+fn fuzz_reject_reason(options: &Options) -> Option<&'static str> {
+    if options.negative != NegativeKind::None {
+        Some("fuzz does not support --negative (different oracle)")
+    } else if options.std == Std::Cljs {
+        Some("fuzz does not support --std cljs (execution is JVM-only)")
+    } else {
+        None
+    }
+}
+
+/// Fuzz pre-dispatch decision, resolved before any generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FuzzGate {
+    Help,
+    Version,
+    Errors,
+    Rejected,
+    Go,
+}
+
+fn fuzz_gate(parsed: &cli::Parsed) -> FuzzGate {
+    if parsed.help {
+        FuzzGate::Help
+    } else if parsed.version {
+        FuzzGate::Version
+    } else if !parsed.errors.is_empty() {
+        FuzzGate::Errors
+    } else if fuzz_reject_reason(&parsed.options).is_some() {
+        FuzzGate::Rejected
+    } else {
+        FuzzGate::Go
+    }
+}
+
 /// Unattended fuzz loop: generate `--count` programs from `-s` into
 /// per-seed subdirs and verify each across all backends.
 fn run_fuzz(args: &[String]) -> ExitCode {
     let parsed = cli::parse_args(args);
-    if !parsed.errors.is_empty() {
-        for e in &parsed.errors {
-            eprintln!("error: {e}");
+    match fuzz_gate(&parsed) {
+        FuzzGate::Help => {
+            print_full_help();
+            return ExitCode::SUCCESS;
         }
-        return ExitCode::from(2);
+        FuzzGate::Version => {
+            println!("clojure-yarpgen {}", cli::VERSION);
+            return ExitCode::SUCCESS;
+        }
+        FuzzGate::Errors => {
+            for e in &parsed.errors {
+                eprintln!("error: {e}");
+            }
+            return ExitCode::from(2);
+        }
+        FuzzGate::Rejected => {
+            if let Some(reason) = fuzz_reject_reason(&parsed.options) {
+                eprintln!("error: {reason}");
+            }
+            return ExitCode::from(2);
+        }
+        FuzzGate::Go => {}
     }
     let options = parsed.options;
-    if options.negative != NegativeKind::None {
-        eprintln!("error: fuzz does not support --negative (different oracle)");
-        return ExitCode::from(2);
-    }
     let classpath = match runner::find_clojure_classpath() {
         Some(cp) => cp,
         None => {
@@ -242,13 +287,47 @@ fn run_fuzz(args: &[String]) -> ExitCode {
     }
 }
 
-fn run_verify(args: &[String]) -> ExitCode {
+/// Verify argument dispatch: help/version short-circuit before
+/// any directory is treated as a test.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VerifyAction {
+    Help,
+    Version,
+    Usage,
+    Run { dir: PathBuf, only: Vec<String> },
+}
+
+fn verify_action(args: &[String]) -> VerifyAction {
     if args.is_empty() {
-        eprintln!("Usage: clojure-yarpgen verify <test-dir> [backend...]");
-        return ExitCode::from(2);
+        VerifyAction::Usage
+    } else if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
+        VerifyAction::Help
+    } else if args.len() == 1 && (args[0] == "--version" || args[0] == "-v") {
+        VerifyAction::Version
+    } else {
+        VerifyAction::Run {
+            dir: PathBuf::from(&args[0]),
+            only: args[1..].to_vec(),
+        }
     }
-    let dir = PathBuf::from(&args[0]);
-    let only: Vec<String> = args[1..].to_vec();
+}
+
+fn run_verify(args: &[String]) -> ExitCode {
+    let (dir, only) = match verify_action(args) {
+        VerifyAction::Help => {
+            print_full_help();
+            return ExitCode::SUCCESS;
+        }
+        VerifyAction::Version => {
+            println!("clojure-yarpgen {}", cli::VERSION);
+            return ExitCode::SUCCESS;
+        }
+        VerifyAction::Usage => {
+            eprintln!("Usage: clojure-yarpgen verify <test-dir> [backend...]");
+            return ExitCode::from(2);
+        }
+        VerifyAction::Run { dir, only } => (dir, only),
+    };
     let classpath = match runner::find_clojure_classpath() {
         Some(cp) => cp,
         None => {
@@ -279,6 +358,13 @@ fn run_verify(args: &[String]) -> ExitCode {
     }
 }
 
+fn print_full_help() {
+    print!("{}", cli::usage());
+    println!(
+        "Commands:\n  verify DIR [backend...]  run a generated test across backends\n  fuzz [options]           generate --count tests and verify each"
+    );
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|s| s.as_str()) == Some("verify") {
@@ -289,10 +375,7 @@ fn main() -> ExitCode {
     }
     let parsed = cli::parse_args(&args);
     if parsed.help {
-        print!("{}", cli::usage());
-        println!(
-            "Commands:\n  verify DIR [backend...]  run a generated test across backends\n  fuzz [options]           generate --count tests and verify each"
-        );
+        print_full_help();
         return ExitCode::SUCCESS;
     }
     if parsed.version {
@@ -307,4 +390,65 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     run_generate(&parsed.options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fuzz_gate_routes_help_version_errors() {
+        // --help/--version must short-circuit: running a random fuzz
+        // (and writing seed dirs) on a help flag is a side effect.
+        assert_eq!(
+            fuzz_gate(&cli::parse_args(&words(&["--help"]))),
+            FuzzGate::Help
+        );
+        assert_eq!(
+            fuzz_gate(&cli::parse_args(&words(&["--version"]))),
+            FuzzGate::Version
+        );
+        assert_eq!(
+            fuzz_gate(&cli::parse_args(&words(&["--bogus", "1"]))),
+            FuzzGate::Errors
+        );
+        assert_eq!(
+            fuzz_gate(&cli::parse_args(&words(&["--std", "cljs"]))),
+            FuzzGate::Rejected
+        );
+        assert_eq!(fuzz_gate(&cli::parse_args(&words(&[]))), FuzzGate::Go);
+    }
+
+    #[test]
+    fn verify_action_routes_help_version_usage() {
+        assert_eq!(verify_action(&words(&[])), VerifyAction::Usage);
+        assert_eq!(verify_action(&words(&["--help"])), VerifyAction::Help);
+        assert_eq!(verify_action(&words(&["-v"])), VerifyAction::Version);
+        match verify_action(&words(&["dir", "default"])) {
+            VerifyAction::Run { dir, only } => {
+                assert_eq!(dir, PathBuf::from("dir"));
+                assert_eq!(only, vec!["default".to_string()]);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fuzz_rejects_negative_and_cljs() {
+        let negative = Options {
+            negative: NegativeKind::All,
+            ..Options::default()
+        };
+        assert!(fuzz_reject_reason(&negative).is_some());
+        let cljs = Options {
+            std: Std::Cljs,
+            ..Options::default()
+        };
+        assert!(fuzz_reject_reason(&cljs).is_some());
+        assert!(fuzz_reject_reason(&Options::default()).is_none());
+    }
 }

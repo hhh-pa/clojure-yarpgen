@@ -34,10 +34,10 @@ impl Rng {
         self.seed
     }
 
-    /// Derive an independent child RNG (for mutation state).
-    /// Always deterministic: unlike [`Rng::new`], a derived zero is
-    /// remapped instead of meaning "random", keeping mutations
-    /// reproducible for every salt.
+    /// Derive a child RNG (for mutation state) by salting the
+    /// seed. Deterministic but not statistically independent: unlike
+    /// [`Rng::new`], a derived zero is remapped instead of meaning
+    /// "random", keeping mutations reproducible for every salt.
     pub fn fork(&self, salt: u64) -> Self {
         let eff = self.seed ^ salt.wrapping_mul(0x94d049bb133111eb);
         let eff = if eff == 0 { 1 } else { eff };

@@ -21,12 +21,15 @@ cargo build --release
 ./target/release/clojure-yarpgen fuzz -s 1 --count 50 -o out/fuzz
 ```
 
-`verify` runs the test on every backend (default JIT and C1-only) and
-prints `PASS` when all observed hashes equal the expected hash:
+`verify` runs the test on every backend (default JIT, C1-only,
+direct-linking, and Babashka when installed) and prints `PASS` when
+all observed hashes equal the expected hash:
 
 ```
 [default] exit=0 hash=-2585397846746023539 timed-out=false
 [c1-only] exit=0 hash=-2585397846746023539 timed-out=false
+[direct-link] exit=0 hash=-2585397846746023539 timed-out=false
+[bb] exit=0 hash=-2585397846746023539 timed-out=false
 expected=-2585397846746023539 PASS
 ```
 
@@ -39,15 +42,18 @@ Each test directory holds four files, mirroring YARPGen's layout:
 
 | File           | Contents                                                     |
 | -------------- | ------------------------------------------------------------ |
-| `init.clj`     | input `def`s: scalars plus a few vectors                      |
+| `init.clj`     | input `def`s: scalars, vectors, keyword maps               |
 | `func.clj`     | output atoms, `test-fn-N` chunk functions, `outputs` reader  |
 | `driver.clj`   | runs `test-fn`, prints `<hash> <seed>` (or asserts values)   |
 | `expected.edn` | `{:seed … :expected-hash … :check-algo …}` manifest           |
 
 `test-fn` is loop nests (`doseq` over `range` plus `dotimes`),
-`if`/`when` branches, and atom assignments over integer arithmetic
+`loop`/`recur` blocks with accumulators, `if`/`when` branches,
+sequential `let` blocks, and atom assignments over integer
+arithmetic
 (`+ - * quot rem inc dec abs`), bit operations, comparisons,
-`min`/`max`, and vector `nth`. Top-level statements are chunked into
+`min`/`max`, vector `nth`, and map reads (`get`, keyword-invoke,
+`get`-with-default, reads through `assoc`). Top-level statements are chunked into
 sequential `test-fn-N` functions so no single method nears the 64KB
 JVM limit (`--top-stmts` scales program size, `--max-fn-cost` the
 per-function budget). Example fragment:
@@ -90,17 +96,20 @@ generation time:
 
 Ported from YARPGen's probability tables:
 
-| Knob                 | Default                                  |
-| -------------------- | ---------------------------------------- |
-| statements           | ≤ 1000, scopes of 2–5                    |
-| loop nests           | depth 2–3 (cap 5), bounds 10–25, step 1–4|
-| `if`/`else`          | depth ≤ 5, else-branch 20%               |
-| expression depth     | ≤ 4                                      |
-| inputs/outputs       | 10–20 scalars + 2 vectors                |
-| assign vs reduction  | 70 / 30                                  |
-| SimilarOperators     | 10% single-family expressions            |
-| ConstUse             | 10% all-const leaves                     |
-| special constants    | 30% (0, min/max, bit patterns)           |
+| Knob                 | Default                                        |
+| -------------------- | ---------------------------------------------- |
+| statements           | ≤ 1000; top scope 2–5, nested taper 1–4/1–3/1–2|
+| loop nests           | depth 2–3 (cap 5); 10–25 halve per depth, step 1–4|
+| `loop`/`recur`       | counter + 0–2 accumulators, depth-scaled bounds|
+| `let` blocks         | 1–3 sequential bindings, depth ≤ 5             |
+| `if`/`else`          | depth ≤ 5, else-branch 20%                     |
+| expression depth     | ≤ 4                                            |
+| inputs/outputs       | 10–20 scalars + 2 vectors + 2 maps             |
+| structures           | loop/doseq, nest, if, let, recur 10 each, stub 50|
+| assign vs reduction  | 70 / 30                                        |
+| SimilarOperators     | 10% single-family expressions                  |
+| ConstUse             | 10% all-const leaves                           |
+| special constants    | 30% (0, min/max, bit patterns)                 |
 
 `--param-shuffle=false` freezes the weights; `--simple-loops=all`
 selects a flat, analyzer-friendly profile.
@@ -116,10 +125,11 @@ selects a flat, analyzer-friendly profile.
 
 The backend matrix is `{default JIT, C1-only
 (-XX:TieredStopAtLevel=1), direct-link
-(-Dclojure.compiler.direct-linking=true)}`: disagreement between
-backends signals a miscompilation of the generated shape.
+(-Dclojure.compiler.direct-linking=true), bb (Babashka
+interpreter, when installed)}`: disagreement between backends
+signals a miscompilation of the generated shape.
 `verify DIR [backend...]` selects a subset; `fuzz` runs every
-backend for every seed.
+available backend for every seed.
 
 ## CLI reference
 
@@ -134,8 +144,8 @@ backend for every seed.
 --mutate none|exprs|all        re-roll RHS exprs (+ loop bounds for all)
 --mutation-seed N
 --allow-exc-in-dead none|some|all  keep faults in dead branches (default none)
---max-array-dims N      vector-length cap (0 = default 8)
---max-nesting N         nesting guard (0 = default 64)
+--max-array-dims N      vector length (0 = default 8, capped at 65536)
+--max-nesting N         loop/if depth cap, negative-suite depth (0 = defaults)
 --simple-loops none|some|all
 --unchecked-math on|off compile test-fn with *unchecked-math* (default off)
 --dg-headers true|false DejaGNU dg directives for torture-suite interop

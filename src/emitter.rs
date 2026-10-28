@@ -64,10 +64,13 @@ pub struct EmitPaths {
 /// Top-level statements are chunked into sequential `test-fn-N`
 /// functions so no single method nears the 64KB JVM limit.
 pub const MAX_FN_COST: u64 = 60;
-/// Maximum cost units for a single top-level statement. Statements
-/// past this bar cannot be chunked further, so generation repopulates
-/// (mutation retries) instead of emitting them.
-pub const MAX_STMT_COST: u64 = 150;
+/// Maximum cost units for a single top-level statement: a backstop
+/// against absurd expressions, not the 64KB guard. Control flow is
+/// far denser per unit than straight-line code (a ~9000-unit
+/// straight-line method compiled fine, while a control-dense method
+/// broke 64KB), so the rendered-source bar in `stmt::stmt_fits` is
+/// the real ceiling and this bar rarely binds.
+pub const MAX_STMT_COST: u64 = 2000;
 
 /// Output file paths for a test directory and dialect.
 pub fn output_paths(out_dir: &Path, std: Std) -> EmitPaths {
@@ -90,7 +93,7 @@ fn extension(std: Std) -> &'static str {
 
 fn options_summary(o: &Options) -> String {
     format!(
-        "std={:?} check-algo={:?} emit-pragmas={:?} param-shuffle={} expl-loop-param={} mutate={:?} allow-exc-in-dead={:?} simple-loops={:?} unchecked-math={:?}",
+        "std={:?} check-algo={:?} emit-pragmas={:?} param-shuffle={} expl-loop-param={} mutate={:?} allow-exc-in-dead={:?} simple-loops={:?} unchecked-math={:?} count={} top-stmts={} max-fn-cost={} max-array-dims={} max-nesting={} dg-headers={} negative={:?}",
         o.std,
         o.check_algo,
         o.emit_pragmas,
@@ -99,7 +102,14 @@ fn options_summary(o: &Options) -> String {
         o.mutate,
         o.allow_exc_in_dead,
         o.simple_loops,
-        o.unchecked_math
+        o.unchecked_math,
+        o.count,
+        o.top_stmts,
+        o.max_fn_cost,
+        o.max_array_dims,
+        o.max_nesting,
+        o.dg_headers,
+        o.negative,
     )
 }
 
@@ -121,7 +131,9 @@ fn dg_header(check_algo: CheckAlgo) -> &'static str {
             ";; { dg-do run }\n;; { dg-mode interp+aot }\n;; { dg-output \"TORTURE-PASS\" }\n"
         }
         CheckAlgo::Hash => {
-            ";; { dg-do run }\n;; { dg-mode interp+aot }\n;; { dg-output-re \"^-?[0-9]+ [0-9]+$\" }\n"
+            // Both values print as i64 (the seed wraps past i64::MAX),
+            // so both classes admit a sign.
+            ";; { dg-do run }\n;; { dg-mode interp+aot }\n;; { dg-output-re \"^-?[0-9]+ -?[0-9]+$\" }\n"
         }
     }
 }
@@ -135,6 +147,8 @@ fn roll_hint(rng: &mut Rng, mode: Density) -> bool {
 }
 
 /// Walk emitted body forms, hinting `doseq` binding symbols per roll.
+/// The binding vector is a `__vec__`-marked list, so it matches as a
+/// 3-element list with the bound symbol in the middle.
 fn hint_loops(form: Sexp, rng: &mut Rng, mode: Density) -> Sexp {
     match form {
         Sexp::List(items) => {
@@ -188,6 +202,19 @@ fn init_forms(program: &Program) -> Vec<Sexp> {
                 Sexp::sym(&input.name),
                 Sexp::vec(items.iter().map(|n| Sexp::int(*n)).collect()),
             ]),
+            Value::Map(items) => {
+                // BTreeMap iteration is sorted: deterministic output.
+                let mut pairs = Vec::with_capacity(items.len() * 2);
+                for (k, v) in items {
+                    pairs.push(Sexp::sym(&format!(":{k}")));
+                    pairs.push(Sexp::int(*v));
+                }
+                Sexp::list(vec![
+                    Sexp::sym("def"),
+                    Sexp::sym(&input.name),
+                    Sexp::map(pairs),
+                ])
+            }
             Value::Bool(b) => Sexp::list(vec![
                 Sexp::sym("def"),
                 Sexp::sym(&input.name),
@@ -396,13 +423,18 @@ pub fn emit_test(
     fs::write(
         &paths.expected,
         format!(
-            "{{:seed {} :expected-hash {} :check-algo :{}}}\n",
+            "{{:seed {} :expected-hash {} :check-algo :{} :std :{}}}\n",
             program.seed,
             program.expected_hash,
             match program.check_algo {
                 CheckAlgo::Hash => "hash",
                 CheckAlgo::Asserts => "asserts",
-            }
+            },
+            match options.std {
+                Std::Clj => "clj",
+                Std::Cljs => "cljs",
+                Std::Cljc => "cljc",
+            },
         ),
     )?;
     Ok(())
@@ -454,6 +486,10 @@ mod tests {
         }
         let manifest = fs::read_to_string(&res.expected).unwrap();
         assert!(manifest.contains(":expected-hash 123"));
+        assert!(manifest.contains(":std :clj"));
+        let func = fs::read_to_string(&res.func).unwrap();
+        assert!(func.contains("top-stmts="));
+        assert!(func.contains("max-fn-cost="));
         let driver = fs::read_to_string(&res.driver).unwrap();
         assert!(driver.contains("gen-driver"));
         assert!(driver.contains("seed 42"));
@@ -487,6 +523,44 @@ mod tests {
     }
 
     #[test]
+    fn hints_appear_on_doseq_bindings() {
+        // Positive companion to hints_never_appear_on_defs: with
+        // Density::All every doseq binding is hinted, with None none
+        // is. The match depends on the __vec__ marker shape.
+        let atoms: BTreeSet<String> = ["out-0".to_string()].into_iter().collect();
+        let mut ctx = crate::context::GenCtx::new();
+        let oid = ctx.add_output("out-0", CType::Long, Value::Long(0));
+        let s = Stmt::Loop {
+            var: "i".to_string(),
+            start: 0,
+            end: 10,
+            step: 1,
+            body: vec![Stmt::Assign {
+                target: "out-0".to_string(),
+                target_id: oid,
+                expr: crate::expr::Expr::Const(Ir::long(1)),
+            }],
+        };
+        let form = stmt::to_sexp(&s, &atoms);
+        assert!(contains_hinted(&hint_loops(
+            form.clone(),
+            &mut Rng::new(1),
+            Density::All
+        )));
+        assert!(!contains_hinted(&hint_loops(
+            form,
+            &mut Rng::new(1),
+            Density::None
+        )));
+    }
+
+    #[test]
+    fn dg_header_matches_signed_hash_and_seed() {
+        assert!(dg_header(CheckAlgo::Hash).contains("^-?[0-9]+ -?[0-9]+$"));
+        assert!(dg_header(CheckAlgo::Asserts).contains("TORTURE-PASS"));
+    }
+
+    #[test]
     fn asserts_driver_checks_values() {
         let mut p = sample_program();
         p.check_algo = CheckAlgo::Asserts;
@@ -498,5 +572,27 @@ mod tests {
             .join("\n");
         assert!(flat.contains("TORTURE-PASS"));
         assert!(flat.contains("value mismatch"));
+    }
+
+    #[test]
+    fn map_inputs_emit_keyword_literals() {
+        // Sorted keys, keyword syntax, deterministic rendering.
+        let mut p = sample_program();
+        p.inputs.push(Input {
+            name: "map-0".to_string(),
+            typ: CType::Map,
+            value: Value::Map(
+                [("kb".to_string(), 2), ("ka".to_string(), 1)]
+                    .into_iter()
+                    .collect(),
+            ),
+        });
+        let forms = init_forms(&p);
+        let flat = forms
+            .iter()
+            .map(|f| f.flat())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("(def map-0 {:ka 1 :kb 2})"), "{flat}");
     }
 }

@@ -65,6 +65,7 @@ pub struct Policy {
     pub nth_prob: f64,
     pub map_prob: f64,
     pub record_prob: f64,
+    pub seq_prob: f64,
     pub int_types: Vec<crate::types::CType>,
     pub max_vector_len: i64,
     pub ub_allow_weight: u32,
@@ -114,6 +115,7 @@ impl Default for Policy {
             nth_prob: 0.15,
             map_prob: 0.15,
             record_prob: 0.4,
+            seq_prob: 0.1,
             int_types: vec![
                 CType::Bool,
                 CType::Int,

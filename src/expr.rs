@@ -8,7 +8,7 @@ use crate::context::{GenCtx, VarId};
 use crate::policy::{NodeKind, Policy};
 use crate::rng::Rng;
 use crate::sexp::Sexp;
-use crate::types::{self, BinOp, CType, ExKind, Ir, UnOp, Value};
+use crate::types::{self, BinOp, CType, ExKind, Ir, SeqPred, UnOp, Value};
 use std::collections::BTreeMap;
 
 const MAX_REBUILD_ATTEMPTS: i32 = 8;
@@ -80,6 +80,51 @@ pub enum Expr {
         map_ctor: bool,
         ir: Ir,
     },
+    /// A `(range start end step)` pipeline source. Non-empty by
+    /// construction (end > start, step > 0); the IR is the
+    /// materialized vector.
+    SeqRange {
+        start: i64,
+        end: i64,
+        step: i64,
+        ir: Ir,
+    },
+    /// A realized seq pipeline: stages left to right over the source,
+    /// then a scalar terminator. Sources are small (ranges, vecs of
+    /// at most 64), every stage is total, and First/Last/Min/Max
+    /// forms are gated on non-empty finals — so the node is clean by
+    /// construction and loop-invariant (immutable sources, closed
+    /// combinators; only take/drop counts re-evaluate).
+    SeqPipe {
+        source: Box<Expr>,
+        stages: Vec<SeqStage>,
+        term: SeqTerm,
+        ir: Ir,
+    },
+}
+
+/// One order-preserving pipeline stage. `Take`/`Drop` counts are
+/// scalar subtrees (total for every long: negatives clamp); `Doall`
+/// forces intermediate realization and is value-transparent.
+#[derive(Clone, Debug)]
+pub enum SeqStage {
+    Map(UnOp),
+    Filter(SeqPred),
+    Take(Box<Expr>),
+    Drop(Box<Expr>),
+    Doall,
+}
+
+/// How a pipeline becomes a scalar. `Reduce` folds a small constant
+/// seed (Mul excluded: products of small ints overflow); `Apply` has
+/// no seed, so Min/Max forms only emit over non-empty finals.
+#[derive(Clone, Debug)]
+pub enum SeqTerm {
+    Count,
+    First,
+    Last,
+    Reduce { op: BinOp, init: Box<Expr> },
+    Apply(BinOp),
 }
 
 impl Expr {
@@ -95,6 +140,8 @@ impl Expr {
             Expr::Get { ir, .. } => ir,
             Expr::Assoc { ir, .. } => ir,
             Expr::Record { ir, .. } => ir,
+            Expr::SeqRange { ir, .. } => ir,
+            Expr::SeqPipe { ir, .. } => ir,
         }
     }
 }
@@ -232,9 +279,9 @@ fn gen_binary(
     } else {
         *rng.pick(BinOp::scalar())
     };
-    // The pool propagates to the whole subtree (subscript index
-    // and map value/default trees excepted: gen_nth/gen_get roll
-    // those separately).
+    // The pool propagates to the whole subtree (subscript index,
+    // map value/default, and seq count/seed trees excepted:
+    // gen_nth/gen_get/gen_seq roll those separately).
     let left = generate(rng, policy, genctx, depth + 1, false, pool);
     let right = generate(rng, policy, genctx, depth + 1, false, pool);
     let ir = types::eval_binop(op, left.ir(), right.ir());
@@ -498,6 +545,256 @@ fn gen_get(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr 
     }
 }
 
+/// Run pipeline stages over materialized items. Shared by
+/// construction (evaluator reads stored IRs) and live simulation
+/// (evaluator re-evaluates): one implementation, no drift. Element
+/// and count faults propagate with their kind.
+pub(crate) fn run_seq_stages(
+    items: Vec<i64>,
+    stages: &[SeqStage],
+    eval: &dyn Fn(&Expr) -> Ir,
+) -> Result<Vec<i64>, ExKind> {
+    let mut items = items;
+    for s in stages {
+        match s {
+            SeqStage::Map(op) => {
+                let mut out = Vec::with_capacity(items.len());
+                for el in items {
+                    let r = types::eval_unop(*op, &Ir::long(el));
+                    if !r.is_ok() {
+                        return Err(r.ex);
+                    }
+                    out.push(r.value.as_long());
+                }
+                items = out;
+            }
+            SeqStage::Filter(p) => items.retain(|el| p.eval(*el)),
+            SeqStage::Take(n) => {
+                let k = seq_count(n, eval)?;
+                items.truncate(k.clamp(0, items.len() as i64) as usize);
+            }
+            SeqStage::Drop(n) => {
+                let k = seq_count(n, eval)?;
+                let d = k.clamp(0, items.len() as i64) as usize;
+                items.drain(..d);
+            }
+            SeqStage::Doall => {}
+        }
+    }
+    Ok(items)
+}
+
+fn seq_count(n: &Expr, eval: &dyn Fn(&Expr) -> Ir) -> Result<i64, ExKind> {
+    let nv = eval(n);
+    if nv.is_ok() {
+        Ok(nv.value.as_long())
+    } else {
+        Err(nv.ex)
+    }
+}
+
+/// Apply a scalar terminator to final items. First/Last and
+/// Min/Max-apply over an empty final fault Oob: unreachable by
+/// construction (gated), so strict simulation rejects rather than
+/// inventing the nil the runtime would produce.
+pub(crate) fn apply_seq_term(items: &[i64], term: &SeqTerm, eval: &dyn Fn(&Expr) -> Ir) -> Ir {
+    let oob = || Ir::new(CType::Long, Value::Long(0), ExKind::Oob);
+    match term {
+        SeqTerm::Count => Ir::long(items.len() as i64),
+        SeqTerm::First => items.first().map_or_else(oob, |n| Ir::long(*n)),
+        SeqTerm::Last => items.last().map_or_else(oob, |n| Ir::long(*n)),
+        SeqTerm::Reduce { op, init } => {
+            let seed = eval(init);
+            if !seed.is_ok() {
+                return Ir::new(CType::Long, Value::Long(0), seed.ex);
+            }
+            let mut acc = seed;
+            for el in items {
+                acc = types::eval_binop(*op, &acc, &Ir::long(*el));
+                if !acc.is_ok() {
+                    return Ir::new(CType::Long, Value::Long(0), acc.ex);
+                }
+            }
+            acc
+        }
+        SeqTerm::Apply(op) => {
+            if items.is_empty() {
+                // `(apply + [])` is `(+)` is 0 (probed); every other
+                // op needs an element (min/max of nothing throw).
+                if *op == BinOp::Add {
+                    return Ir::long(0);
+                }
+                return oob();
+            }
+            let mut it = items.iter();
+            // Non-empty, checked above.
+            let mut acc = Ir::long(*it.next().unwrap());
+            for el in it {
+                acc = types::eval_binop(*op, &acc, &Ir::long(*el));
+                if !acc.is_ok() {
+                    return Ir::new(CType::Long, Value::Long(0), acc.ex);
+                }
+            }
+            acc
+        }
+    }
+}
+
+/// Sub-expressions buried in stages/terms (take/drop counts, reduce
+/// seeds): the walker/cost/collector recursion set.
+pub(crate) fn stage_subexprs(s: &SeqStage) -> Vec<&Expr> {
+    match s {
+        SeqStage::Take(n) | SeqStage::Drop(n) => vec![n],
+        _ => vec![],
+    }
+}
+
+pub(crate) fn term_subexprs(t: &SeqTerm) -> Vec<&Expr> {
+    match t {
+        SeqTerm::Reduce { init, .. } => vec![init],
+        _ => vec![],
+    }
+}
+
+/// Maximum vector-input length a pipeline may realize. Bounds model
+/// cost (a 64K input would charge 64K evaluations per simulation
+/// step); larger vectors fall back to range sources.
+const MAX_SEQ_SOURCE_LEN: usize = 64;
+
+/// A scalar subtree that always evaluates: raw generation with a
+/// faulty root replaced by a leaf (leaves are always clean).
+fn clean_subexpr(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr {
+    let mut e = generate(rng, policy, genctx, depth + 1, false, &None);
+    if !e.ir().is_ok() {
+        e = leaf(rng, policy, genctx, false, false);
+    }
+    e
+}
+
+/// A `(range start end step)` source with at most ~48 elements: big
+/// enough to cross seq-chunk boundaries, tiny for the model.
+fn seq_range_source(rng: &mut Rng) -> (Expr, Vec<i64>) {
+    let start = rng.gen_range(0, 8);
+    let end = rng.gen_range(start + 2, 48);
+    let step = rng.gen_range(1, 3);
+    let mut items = Vec::new();
+    let mut i = start;
+    while i < end {
+        items.push(i);
+        i += step;
+    }
+    let ir = Ir::new(CType::Vec, Value::Vec(items.clone()), ExKind::NoEx);
+    (
+        Expr::SeqRange {
+            start,
+            end,
+            step,
+            ir,
+        },
+        items,
+    )
+}
+
+/// A scalar terminator, gated on the final items: First/Last need an
+/// element, Min/Max-apply need one too (else Add's identity).
+fn pick_seq_term(rng: &mut Rng, final_items: &[i64]) -> SeqTerm {
+    match rng.gen_usize(5) {
+        0 => SeqTerm::Count,
+        1 if !final_items.is_empty() => SeqTerm::First,
+        2 if !final_items.is_empty() => SeqTerm::Last,
+        3 => SeqTerm::Reduce {
+            op: *rng.pick(&[BinOp::Add, BinOp::Min, BinOp::Max]),
+            init: Box::new(Expr::Const(Ir::long(rng.gen_range(-10, 10)))),
+        },
+        4 => {
+            let op = *rng.pick(&[BinOp::Add, BinOp::Min, BinOp::Max]);
+            SeqTerm::Apply(if final_items.is_empty() && op != BinOp::Add {
+                BinOp::Add
+            } else {
+                op
+            })
+        }
+        _ => SeqTerm::Count,
+    }
+}
+
+/// A realized seq pipeline over a small vector input or a range
+/// literal: 1-3 order-preserving stages plus a scalar terminator.
+/// Total by construction (bounded values, clamped counts, gated
+/// empties), so the node is always clean and loop-invariant.
+fn gen_seq(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr {
+    let small_vecs: Vec<VarId> = genctx
+        .all_vars()
+        .into_iter()
+        .filter(|id| {
+            genctx.var_type(*id) == CType::Vec
+                && matches!(genctx.var_value(*id), Value::Vec(items) if items.len() <= MAX_SEQ_SOURCE_LEN)
+        })
+        .collect();
+    let (source, items) = if !small_vecs.is_empty() && rng.roll(0.5) {
+        let v = *rng.pick(&small_vecs);
+        match genctx.var_value(v) {
+            Value::Vec(items) => {
+                let var = Expr::Var {
+                    id: v,
+                    name: genctx.var_name(v).to_string(),
+                    ir: Ir::new(CType::Vec, Value::Vec(items.clone()), ExKind::NoEx),
+                };
+                (var, items.clone())
+            }
+            _ => seq_range_source(rng),
+        }
+    } else {
+        seq_range_source(rng)
+    };
+    let mut stages = Vec::new();
+    for _ in 0..rng.gen_range(1, 3) {
+        match rng.gen_usize(4) {
+            0 => stages.push(SeqStage::Map(*rng.pick(&[
+                UnOp::Neg,
+                UnOp::BNot,
+                UnOp::Inc,
+                UnOp::Dec,
+                UnOp::Abs,
+            ]))),
+            1 => stages.push(SeqStage::Filter(*rng.pick(&[
+                SeqPred::Odd,
+                SeqPred::Even,
+                SeqPred::Pos,
+                SeqPred::Neg,
+                SeqPred::Zero,
+            ]))),
+            2 => stages.push(SeqStage::Take(Box::new(clean_subexpr(
+                rng, policy, genctx, depth,
+            )))),
+            _ => stages.push(SeqStage::Drop(Box::new(clean_subexpr(
+                rng, policy, genctx, depth,
+            )))),
+        }
+    }
+    if rng.roll(0.4) {
+        stages.insert(rng.gen_usize(stages.len() + 1), SeqStage::Doall);
+    }
+    let (term, ir) = match run_seq_stages(items, &stages, &|e| e.ir().clone()) {
+        // Unreachable: stages are total over bounded values and
+        // counts are leaf-clean. Emit a valid Count node carrying
+        // the fault so generate_safe regenerates (or dead code keeps
+        // a well-formed tree).
+        Err(ex) => (SeqTerm::Count, Ir::new(CType::Long, Value::Long(0), ex)),
+        Ok(final_items) => {
+            let term = pick_seq_term(rng, &final_items);
+            let ir = apply_seq_term(&final_items, &term, &|e| e.ir().clone());
+            (term, ir)
+        }
+    };
+    Expr::SeqPipe {
+        source: Box::new(source),
+        stages,
+        term,
+        ir,
+    }
+}
+
 /// Generate a random expression AST of at most `max_arith_depth`.
 pub fn generate(
     rng: &mut Rng,
@@ -528,6 +825,8 @@ pub fn generate(
                 gen_nth(rng, policy, genctx, depth)
             } else if !want_bool && rng.roll(policy.map_prob) {
                 gen_get(rng, policy, genctx, depth)
+            } else if !want_bool && rng.roll(policy.seq_prob) {
+                gen_seq(rng, policy, genctx, depth)
             } else {
                 gen_binary(rng, policy, genctx, depth, want_bool, pool)
             }
@@ -667,17 +966,7 @@ pub fn to_sexp(node: &Expr, atoms: &std::collections::BTreeSet<String>) -> Sexp 
                 Sexp::sym(name)
             }
         }
-        Expr::UnOp { op, arg, .. } => {
-            let s = match op {
-                UnOp::Neg => "-",
-                UnOp::BNot => "bit-not",
-                UnOp::Inc => "inc",
-                UnOp::Dec => "dec",
-                UnOp::Abs => "abs",
-                UnOp::Pos => "+",
-            };
-            Sexp::list(vec![Sexp::sym(s), to_sexp(arg, atoms)])
-        }
+        Expr::UnOp { op, arg, .. } => Sexp::list(vec![Sexp::sym(op.sym()), to_sexp(arg, atoms)]),
         Expr::BinOp {
             op, left, right, ..
         } => Sexp::list(vec![
@@ -747,6 +1036,53 @@ pub fn to_sexp(node: &Expr, atoms: &std::collections::BTreeSet<String>) -> Sexp 
                 Sexp::list(items)
             }
         }
+        Expr::SeqRange {
+            start, end, step, ..
+        } => Sexp::list(vec![
+            Sexp::sym("range"),
+            Sexp::int(*start),
+            Sexp::int(*end),
+            Sexp::int(*step),
+        ]),
+        Expr::SeqPipe {
+            source,
+            stages,
+            term,
+            ..
+        } => {
+            let mut form = to_sexp(source, atoms);
+            for s in stages {
+                form = match s {
+                    SeqStage::Map(op) => {
+                        Sexp::list(vec![Sexp::sym("map"), Sexp::sym(op.sym()), form])
+                    }
+                    SeqStage::Filter(p) => {
+                        Sexp::list(vec![Sexp::sym("filter"), Sexp::sym(p.sym()), form])
+                    }
+                    SeqStage::Take(n) => {
+                        Sexp::list(vec![Sexp::sym("take"), to_sexp(n, atoms), form])
+                    }
+                    SeqStage::Drop(n) => {
+                        Sexp::list(vec![Sexp::sym("drop"), to_sexp(n, atoms), form])
+                    }
+                    SeqStage::Doall => Sexp::list(vec![Sexp::sym("doall"), form]),
+                };
+            }
+            match term {
+                SeqTerm::Count => Sexp::list(vec![Sexp::sym("count"), form]),
+                SeqTerm::First => Sexp::list(vec![Sexp::sym("first"), form]),
+                SeqTerm::Last => Sexp::list(vec![Sexp::sym("last"), form]),
+                SeqTerm::Reduce { op, init } => Sexp::list(vec![
+                    Sexp::sym("reduce"),
+                    Sexp::sym(op.sym()),
+                    to_sexp(init, atoms),
+                    form,
+                ]),
+                SeqTerm::Apply(op) => {
+                    Sexp::list(vec![Sexp::sym("apply"), Sexp::sym(op.sym()), form])
+                }
+            }
+        }
     }
 }
 
@@ -792,6 +1128,17 @@ mod tests {
             }
             Expr::Assoc { coll, val, .. } => contains_bool(coll) || contains_bool(val),
             Expr::Record { args, .. } => args.iter().any(contains_bool),
+            Expr::SeqRange { .. } => false,
+            Expr::SeqPipe {
+                source,
+                stages,
+                term,
+                ..
+            } => {
+                contains_bool(source)
+                    || stages.iter().flat_map(stage_subexprs).any(contains_bool)
+                    || term_subexprs(term).iter().any(|e| contains_bool(e))
+            }
         }
     }
 
@@ -826,6 +1173,17 @@ mod tests {
             }
             Expr::Assoc { coll, val, .. } => all_clean(coll) && all_clean(val),
             Expr::Record { args, .. } => args.iter().all(all_clean),
+            Expr::SeqRange { .. } => true,
+            Expr::SeqPipe {
+                source,
+                stages,
+                term,
+                ..
+            } => {
+                all_clean(source)
+                    && stages.iter().flat_map(stage_subexprs).all(all_clean)
+                    && term_subexprs(term).iter().all(|e| all_clean(e))
+            }
         }
     }
 
@@ -866,8 +1224,8 @@ mod tests {
     }
 
     fn collect_binops(node: &Expr, out: &mut Vec<BinOp>) {
-        // Subscript index trees and map value/default/ctor trees
-        // roll outside the pool; skip them.
+        // Subscript index trees and map value/default/ctor/count
+        // trees roll outside the pool; skip them.
         match node {
             Expr::BinOp {
                 op, left, right, ..
@@ -883,7 +1241,9 @@ mod tests {
             | Expr::IdxMod { .. }
             | Expr::Get { .. }
             | Expr::Assoc { .. }
-            | Expr::Record { .. } => {}
+            | Expr::Record { .. }
+            | Expr::SeqRange { .. }
+            | Expr::SeqPipe { .. } => {}
         }
     }
 
@@ -1043,6 +1403,17 @@ mod tests {
             } => contains_get(coll) || contains_get(idx) || contains_get(default),
             Expr::IdxMod { idx, .. } => contains_get(idx),
             Expr::Record { args, .. } => args.iter().any(contains_get),
+            Expr::SeqRange { .. } => false,
+            Expr::SeqPipe {
+                source,
+                stages,
+                term,
+                ..
+            } => {
+                contains_get(source)
+                    || stages.iter().flat_map(stage_subexprs).any(contains_get)
+                    || term_subexprs(term).iter().any(|e| contains_get(e))
+            }
         }
     }
 
@@ -1061,6 +1432,36 @@ mod tests {
                 contains_record(coll) || default.as_ref().is_some_and(|d| contains_record(d))
             }
             Expr::Assoc { coll, val, .. } => contains_record(coll) || contains_record(val),
+            Expr::SeqRange { .. } => false,
+            Expr::SeqPipe {
+                source,
+                stages,
+                term,
+                ..
+            } => {
+                contains_record(source)
+                    || stages.iter().flat_map(stage_subexprs).any(contains_record)
+                    || term_subexprs(term).iter().any(|e| contains_record(e))
+            }
+        }
+    }
+
+    fn contains_seq(node: &Expr) -> bool {
+        match node {
+            Expr::SeqRange { .. } | Expr::SeqPipe { .. } => true,
+            Expr::Const(_) | Expr::Var { .. } => false,
+            Expr::UnOp { arg, .. } => contains_seq(arg),
+            Expr::BinOp { left, right, .. } => contains_seq(left) || contains_seq(right),
+            Expr::Nth { coll, idx, .. } => contains_seq(coll) || contains_seq(idx),
+            Expr::NthDefault {
+                coll, idx, default, ..
+            } => contains_seq(coll) || contains_seq(idx) || contains_seq(default),
+            Expr::IdxMod { idx, .. } => contains_seq(idx),
+            Expr::Get { coll, default, .. } => {
+                contains_seq(coll) || default.as_ref().is_some_and(|d| contains_seq(d))
+            }
+            Expr::Assoc { coll, val, .. } => contains_seq(coll) || contains_seq(val),
+            Expr::Record { args, .. } => args.iter().any(contains_seq),
         }
     }
 
@@ -1134,5 +1535,114 @@ mod tests {
         }
         assert!(saw_record, "no record constructions in 99 seeds");
         assert!(saw_get, "no record reads generated in 99 seeds");
+    }
+
+    #[test]
+    fn seq_pipes_emit_nested_stages() {
+        use std::collections::BTreeSet;
+        let atoms = BTreeSet::new();
+        let src = Expr::SeqRange {
+            start: 0,
+            end: 6,
+            step: 2,
+            ir: Ir::long(0),
+        };
+        let pipe = Expr::SeqPipe {
+            source: Box::new(src),
+            stages: vec![
+                SeqStage::Map(UnOp::Inc),
+                SeqStage::Filter(SeqPred::Odd),
+                SeqStage::Take(Box::new(Expr::Const(Ir::long(2)))),
+            ],
+            term: SeqTerm::Reduce {
+                op: BinOp::Add,
+                init: Box::new(Expr::Const(Ir::long(5))),
+            },
+            ir: Ir::long(0),
+        };
+        assert_eq!(
+            to_sexp(&pipe, &atoms).flat(),
+            "(reduce + 5 (take 2 (filter odd? (map inc (range 0 6 2)))))"
+        );
+        let applied = Expr::SeqPipe {
+            source: Box::new(Expr::SeqRange {
+                start: 0,
+                end: 3,
+                step: 1,
+                ir: Ir::long(0),
+            }),
+            stages: vec![SeqStage::Doall],
+            term: SeqTerm::Apply(BinOp::Min),
+            ir: Ir::long(0),
+        };
+        assert_eq!(
+            to_sexp(&applied, &atoms).flat(),
+            "(apply min (doall (range 0 3 1)))"
+        );
+    }
+
+    #[test]
+    fn seq_pipes_are_clean_across_seeds() {
+        // Pipelines need no inputs at all (range sources always
+        // work), so generation must emit them and every tree stays
+        // clean and bool-free.
+        let mut saw_seq = false;
+        for seed in 1..100u64 {
+            let mut rng = Rng::new(seed);
+            let policy = Policy::default();
+            let ctx = ctx_with_vars();
+            let e = generate_safe(&mut rng, &policy, &ctx, false, Density::None);
+            assert!(e.ir().is_ok(), "seed {seed}: {:?}", e.ir());
+            assert!(all_clean(&e), "seed {seed}: faulty node under SeqPipe");
+            assert!(!contains_bool(&e), "seed {seed}: bool under SeqPipe");
+            saw_seq |= contains_seq(&e);
+        }
+        assert!(saw_seq, "no seq pipelines generated in 99 seeds");
+    }
+
+    #[test]
+    fn seq_runner_matches_hand_values() {
+        // The shared construction/simulation runner, direct: map,
+        // filter, take, and every terminator shape.
+        let run = |items: Vec<i64>, stages: Vec<SeqStage>, term: SeqTerm| {
+            run_seq_stages(items, &stages, &|e| e.ir().clone())
+                .map(|fin| apply_seq_term(&fin, &term, &|e| e.ir().clone()))
+        };
+        let c = |n: i64| Box::new(Expr::Const(Ir::long(n)));
+        // (reduce + 5 (take 2 (filter odd? (map inc [0 1 2 3]))))
+        // = 5 + (1+3) = 9.
+        let stages = vec![
+            SeqStage::Map(UnOp::Inc),
+            SeqStage::Filter(SeqPred::Odd),
+            SeqStage::Take(c(2)),
+        ];
+        let term = SeqTerm::Reduce {
+            op: BinOp::Add,
+            init: c(5),
+        };
+        assert_eq!(
+            run(vec![0, 1, 2, 3], stages, term).unwrap().value,
+            Value::Long(9)
+        );
+        // Empty finals: count is 0, first/last fault Oob (gated away
+        // at construction), apply-+ is its identity.
+        let drop_all = vec![SeqStage::Drop(c(99))];
+        let v = run(vec![1], drop_all.clone(), SeqTerm::Count).unwrap();
+        assert_eq!(v.value, Value::Long(0));
+        let f = run(vec![1], drop_all.clone(), SeqTerm::First).unwrap();
+        assert_eq!(f.ex, ExKind::Oob);
+        let a = run(vec![1], drop_all, SeqTerm::Apply(BinOp::Add)).unwrap();
+        assert_eq!(a.value, Value::Long(0));
+        // Faulty take counts propagate with their kind.
+        let bad = Expr::BinOp {
+            op: BinOp::Div,
+            left: Box::new(Expr::Const(Ir::long(1))),
+            right: Box::new(Expr::Const(Ir::long(0))),
+            ir: Ir::new(CType::Long, Value::Long(0), ExKind::ZeroDiv),
+        };
+        let err = run_seq_stages(vec![1, 2], &[SeqStage::Take(Box::new(bad))], &|e| {
+            e.ir().clone()
+        });
+        assert_eq!(err, Err(ExKind::ZeroDiv));
     }
 }

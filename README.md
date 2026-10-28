@@ -54,9 +54,12 @@ one in ten zero-trip), `loop`/`recur` blocks with accumulators,
 arithmetic
 (`+ - * quot rem inc dec abs`), bit operations, comparisons,
 `min`/`max`, vector `nth`, map reads (`get`, keyword-invoke,
-`get`-with-default, reads through `assoc`), and record reads over
+`get`-with-default, reads through `assoc`), record reads over
 `(defrecord R0 [fa fb fc])` inputs and fresh `(->R0 …)` /
-`(map->R0 …)` constructions. Top-level statements are chunked into
+`(map->R0 …)` constructions, and realized seq pipelines (`map` /
+`filter` / `take` / `drop` / `doall` over ranges and small vectors,
+terminated by `count` / `first` / `last` / `reduce` / `apply`).
+Top-level statements are chunked into
 sequential `test-fn-N` functions so no single method nears the 64KB
 JVM limit (`--top-stmts` scales program size, `--max-fn-cost` the
 per-function budget). Example fragment:

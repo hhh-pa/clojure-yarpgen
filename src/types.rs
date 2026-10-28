@@ -331,6 +331,55 @@ pub enum UnOp {
     Pos,
 }
 
+impl UnOp {
+    /// Emitted Clojure symbol, shared by scalar and `map` emission.
+    pub fn sym(self) -> &'static str {
+        match self {
+            UnOp::Neg => "-",
+            UnOp::BNot => "bit-not",
+            UnOp::Inc => "inc",
+            UnOp::Dec => "dec",
+            UnOp::Abs => "abs",
+            UnOp::Pos => "+",
+        }
+    }
+}
+
+/// Total single-arg predicates for `filter` stages. All total on
+/// longs; probed identical on JVM Clojure and bb, including
+/// negatives (`odd?` of -3 is true) and zero (even, neither pos nor
+/// neg).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeqPred {
+    Odd,
+    Even,
+    Pos,
+    Neg,
+    Zero,
+}
+
+impl SeqPred {
+    pub fn sym(self) -> &'static str {
+        match self {
+            SeqPred::Odd => "odd?",
+            SeqPred::Even => "even?",
+            SeqPred::Pos => "pos?",
+            SeqPred::Neg => "neg?",
+            SeqPred::Zero => "zero?",
+        }
+    }
+
+    pub fn eval(self, x: i64) -> bool {
+        match self {
+            SeqPred::Odd => x % 2 != 0,
+            SeqPred::Even => x % 2 == 0,
+            SeqPred::Pos => x > 0,
+            SeqPred::Neg => x < 0,
+            SeqPred::Zero => x == 0,
+        }
+    }
+}
+
 pub fn eval_binop(op: BinOp, a: &Ir, b: &Ir) -> Ir {
     use BinOp::*;
     // Faults propagate: a faulty operand poisons the whole tree, so a
@@ -661,6 +710,31 @@ mod tests {
         assert!(!CType::Map.is_scalar());
         let m = Ir::new(CType::Map, Value::Map(BTreeMap::new()), ExKind::NoEx);
         assert!(coerce_bool(&m));
+    }
+
+    #[test]
+    fn seq_preds_match_probed_table() {
+        // Probed byte-identical on JVM Clojure 1.12.6 and bb: rows
+        // are (odd? even? pos? neg? zero?).
+        let table: &[(i64, [bool; 5])] = &[
+            (-3, [true, false, false, true, false]),
+            (-2, [false, true, false, true, false]),
+            (-1, [true, false, false, true, false]),
+            (0, [false, true, false, false, true]),
+            (1, [true, false, true, false, false]),
+            (2, [false, true, true, false, false]),
+        ];
+        use SeqPred::{Even, Neg, Odd, Pos, Zero};
+        for (x, want) in table {
+            let got = [
+                Odd.eval(*x),
+                Even.eval(*x),
+                Pos.eval(*x),
+                Neg.eval(*x),
+                Zero.eval(*x),
+            ];
+            assert_eq!(&got, want, "x={x}");
+        }
     }
 
     #[test]

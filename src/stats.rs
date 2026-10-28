@@ -2,7 +2,7 @@
 //! Program statistics. Ports YARPGen's statistics collection.
 
 use crate::emitter::Program;
-use crate::expr::Expr;
+use crate::expr::{stage_subexprs, term_subexprs, Expr};
 use crate::stmt::Stmt;
 use std::collections::BTreeMap;
 
@@ -81,6 +81,24 @@ fn walk_expr(e: &Expr, counts: &mut BTreeMap<String, i64>) {
             bump(counts, "records");
             for a in args {
                 walk_expr(a, counts);
+            }
+        }
+        Expr::SeqRange { .. } => {
+            bump(counts, "seq-ranges");
+        }
+        Expr::SeqPipe {
+            source,
+            stages,
+            term,
+            ..
+        } => {
+            bump(counts, "seq-pipes");
+            walk_expr(source, counts);
+            for e in stages.iter().flat_map(stage_subexprs) {
+                walk_expr(e, counts);
+            }
+            for e in term_subexprs(term) {
+                walk_expr(e, counts);
             }
         }
     }
@@ -192,5 +210,23 @@ pub fn expr_cost(e: &Expr) -> u64 {
         }
         Expr::Assoc { coll, val, .. } => expr_cost(coll) + expr_cost(val),
         Expr::Record { args, .. } => args.iter().map(expr_cost).sum(),
+        Expr::SeqRange { .. } => 0,
+        Expr::SeqPipe {
+            source,
+            stages,
+            term,
+            ..
+        } => {
+            expr_cost(source)
+                + stages
+                    .iter()
+                    .flat_map(stage_subexprs)
+                    .map(expr_cost)
+                    .sum::<u64>()
+                + term_subexprs(term)
+                    .iter()
+                    .map(|e| expr_cost(e))
+                    .sum::<u64>()
+        }
     }
 }

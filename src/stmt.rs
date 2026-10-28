@@ -209,6 +209,43 @@ fn live_value(genctx: &GenCtx, node: &Expr) -> Ir {
                 crate::types::ExKind::NoEx,
             )
         }
+        Expr::SeqRange {
+            start, end, step, ..
+        } => {
+            let mut items = Vec::new();
+            let mut i = *start;
+            while i < *end {
+                items.push(i);
+                i += *step;
+            }
+            Ir::new(CType::Vec, Value::Vec(items), crate::types::ExKind::NoEx)
+        }
+        Expr::SeqPipe {
+            source,
+            stages,
+            term,
+            ..
+        } => {
+            // Same shared runner as construction, re-evaluating
+            // take/drop counts under live bindings; sources are
+            // immutable, so only counts can newly fault.
+            let c = live_value(genctx, source);
+            if !c.is_ok() {
+                return Ir::new(CType::Long, Value::Long(0), c.ex);
+            }
+            let items = match c.value {
+                Value::Vec(items) => items,
+                _ => {
+                    return Ir::new(CType::Long, Value::Long(0), crate::types::ExKind::Oob);
+                }
+            };
+            match expr::run_seq_stages(items, stages, &|e| live_value(genctx, e)) {
+                Err(ex) => Ir::new(CType::Long, Value::Long(0), ex),
+                Ok(final_items) => {
+                    expr::apply_seq_term(&final_items, term, &|e| live_value(genctx, e))
+                }
+            }
+        }
         Expr::Get {
             coll, key, default, ..
         } => {
@@ -1736,6 +1773,47 @@ mod tests {
             }
             other => panic!("expected record, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn simulation_threads_seq_pipelines() {
+        // A hand-built pipeline over a vec input evaluates through
+        // live bindings: (last (drop 1 (filter odd? (map inc v)))).
+        let mut ctx = seeded_ctx();
+        ctx.add_input("v", CType::Vec, Value::Vec(vec![0, 1, 2, 3]));
+        let vid = ctx.id_of("v").unwrap();
+        let oid = ctx.id_of("out-0").unwrap();
+        let pipe = Expr::SeqPipe {
+            source: Box::new(Expr::Var {
+                id: vid,
+                name: "v".to_string(),
+                ir: Ir::long(0),
+            }),
+            stages: vec![
+                expr::SeqStage::Map(types::UnOp::Inc),
+                expr::SeqStage::Filter(types::SeqPred::Odd),
+                expr::SeqStage::Drop(Box::new(Expr::Const(Ir::long(1)))),
+            ],
+            term: expr::SeqTerm::Last,
+            ir: Ir::long(0),
+        };
+        // [0 1 2 3] -> inc [1 2 3 4] -> odd [1 3] -> drop 1 [3].
+        assert_eq!(live_value(&ctx, &pipe).value, Value::Long(3));
+        let prog = vec![Stmt::Assign {
+            target: "out-0".to_string(),
+            target_id: oid,
+            expr: pipe,
+        }];
+        assert_eq!(simulate_bounded(&mut ctx, &prog), Ok(()));
+        assert_eq!(ctx.lookup("out-0").unwrap().as_long(), 3);
+        // Ranges materialize identically under both evaluators.
+        let range = Expr::SeqRange {
+            start: 1,
+            end: 7,
+            step: 2,
+            ir: Ir::long(0),
+        };
+        assert_eq!(live_value(&ctx, &range).value, Value::Vec(vec![1, 3, 5]));
     }
 
     #[test]

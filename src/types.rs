@@ -14,7 +14,6 @@ use crate::rng::Rng;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExKind {
     NoEx,
-    Uninit,
     ArithOvf,
     ZeroDiv,
     Oob,
@@ -22,7 +21,9 @@ pub enum ExKind {
 
 /// Scalar types plus generation-time vectors. All integrals are emitted
 /// as Clojure longs; the width drives special constants and overflow
-/// detection so runtime promotion to BigInt never happens.
+/// detection. Checked long arithmetic throws on overflow (probed:
+/// `addExact`/`multiplyExact`/`incrementExact`), so overflow is a
+/// fault to rebuild, exactly like division by zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CType {
     Bool,
@@ -107,7 +108,16 @@ pub fn sadd(a: &Ir, b: &Ir) -> Ir {
 }
 
 pub fn ssub(a: &Ir, b: &Ir) -> Ir {
-    let r = a.value.as_long() as i128 - b.value.as_long() as i128;
+    let (x, y) = (a.value.as_long(), b.value.as_long());
+    // Probed: non-folded `(- x Long/MIN_VALUE)` ALWAYS throws via an
+    // intermediate negateExact — even `(- -5 MIN)`, which fits — while
+    // fully constant `(- -5 MIN)` folds correctly. Since foldedness is
+    // invisible here, any MIN subtrahend is a fault. (Siblings `+ *`
+    // `quot` `rem` with MIN operands behave per plain math.)
+    if y == i64::MIN {
+        return Ir::ovf();
+    }
+    let r = x as i128 - y as i128;
     if fits_long(r) {
         Ir::long(r as i64)
     } else {
@@ -140,7 +150,8 @@ pub fn smod(a: &Ir, b: &Ir) -> Ir {
     if y == 0 {
         Ir::new(CType::Long, Value::Long(0), ExKind::ZeroDiv)
     } else if x == i64::MIN && y == -1 {
-        Ir::ovf()
+        // Unlike quot, rem cannot overflow: MIN % -1 == 0, no throw.
+        Ir::long(0)
     } else {
         Ir::long(x % y)
     }
@@ -194,6 +205,31 @@ pub fn sxor(a: &Ir, b: &Ir) -> Ir {
 
 pub fn snot(a: &Ir) -> Ir {
     Ir::long(!a.value.as_long())
+}
+
+/// Probed: `(inc Long/MAX_VALUE)` throws (incrementExact).
+pub fn sinc(a: &Ir) -> Ir {
+    let x = a.value.as_long();
+    if x == i64::MAX {
+        Ir::ovf()
+    } else {
+        Ir::long(x + 1)
+    }
+}
+
+/// Probed: `(dec Long/MIN_VALUE)` throws (decrementExact).
+pub fn sdec(a: &Ir) -> Ir {
+    let x = a.value.as_long();
+    if x == i64::MIN {
+        Ir::ovf()
+    } else {
+        Ir::long(x - 1)
+    }
+}
+
+/// Probed: `(abs Long/MIN_VALUE)` wraps to MIN_VALUE, never throws.
+pub fn sabs(a: &Ir) -> Ir {
+    Ir::long(a.value.as_long().wrapping_abs())
 }
 
 /// Floored modulo for index wrapping. Matches Clojure `(mod x m)` for
@@ -276,7 +312,10 @@ impl BinOp {
 pub enum UnOp {
     Neg,
     BNot,
-    /// Identity `(+ x)`; the rebuild target of a faulting negation.
+    Inc,
+    Dec,
+    Abs,
+    /// Identity `(+ x)`; the rebuild target of faulting unary ops.
     Pos,
 }
 
@@ -328,6 +367,9 @@ pub fn eval_unop(op: UnOp, a: &Ir) -> Ir {
     match op {
         UnOp::Neg => sneg(a),
         UnOp::BNot => snot(a),
+        UnOp::Inc => sinc(a),
+        UnOp::Dec => sdec(a),
+        UnOp::Abs => sabs(a),
         UnOp::Pos => a.clone(),
     }
 }
@@ -429,6 +471,44 @@ mod tests {
     }
 
     #[test]
+    fn minus_min_subtrahend_always_faults() {
+        // Probed: `(- x MIN)` throws via negateExact for non-folded x
+        // even when the result fits, so the model faults on any MIN
+        // subtrahend. Only fully constant trees fold around it.
+        assert_eq!(
+            ssub(&Ir::long(-5), &Ir::long(i64::MIN)).ex,
+            ExKind::ArithOvf
+        );
+        assert_eq!(ssub(&Ir::long(0), &Ir::long(i64::MIN)).ex, ExKind::ArithOvf);
+        // Other MIN positions follow plain math.
+        assert_eq!(
+            ssub(&Ir::long(i64::MIN), &Ir::long(-5)).value,
+            Value::Long(i64::MIN + 5)
+        );
+        assert_eq!(
+            sadd(&Ir::long(5), &Ir::long(i64::MIN)).value,
+            Value::Long(i64::MIN + 5)
+        );
+        assert_eq!(
+            smul(&Ir::long(0), &Ir::long(i64::MIN)).value,
+            Value::Long(0)
+        );
+    }
+
+    #[test]
+    fn rem_min_by_neg_one_is_zero() {
+        assert_eq!(
+            smod(&Ir::long(i64::MIN), &Ir::long(-1)),
+            Ir::long(0),
+            "rem cannot overflow, unlike quot"
+        );
+        assert_eq!(
+            sdiv(&Ir::long(i64::MIN), &Ir::long(-1)).ex,
+            ExKind::ArithOvf
+        );
+    }
+
+    #[test]
     fn div_matches_rust_semantics() {
         assert_eq!(sdiv(&Ir::long(7), &Ir::long(-3)).value, Value::Long(-2));
         assert_eq!(smod(&Ir::long(7), &Ir::long(-3)).value, Value::Long(1));
@@ -447,6 +527,17 @@ mod tests {
             sshl(&Ir::long(3), &Ir::long(100)).value,
             Value::Long(206158430208)
         );
+    }
+
+    #[test]
+    fn inc_dec_abs_match_probed_edges() {
+        assert_eq!(sinc(&Ir::long(i64::MAX)).ex, ExKind::ArithOvf);
+        assert_eq!(sinc(&Ir::long(41)).value, Value::Long(42));
+        assert_eq!(sdec(&Ir::long(i64::MIN)).ex, ExKind::ArithOvf);
+        assert_eq!(sdec(&Ir::long(42)).value, Value::Long(41));
+        assert_eq!(sabs(&Ir::long(-5)).value, Value::Long(5));
+        assert_eq!(sabs(&Ir::long(i64::MIN)).value, Value::Long(i64::MIN));
+        assert!(sabs(&Ir::long(i64::MIN)).is_ok());
     }
 
     #[test]

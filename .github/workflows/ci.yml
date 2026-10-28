@@ -18,3 +18,18 @@ jobs:
       - run: cargo test
       - run: cargo build --release
       - run: ./target/release/clojure-yarpgen -s 42 -o out/smoke && ls out/smoke
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Fetch Clojure jars
+        run: |
+          mkdir -p /tmp/clj-cp
+          cd /tmp/clj-cp
+          curl -sSL -O https://repo1.maven.org/maven2/org/clojure/clojure/1.12.0/clojure-1.12.0.jar
+          curl -sSL -O https://repo1.maven.org/maven2/org/clojure/spec.alpha/0.5.238/spec.alpha-0.5.238.jar
+          curl -sSL -O https://repo1.maven.org/maven2/org/clojure/core.specs.alpha/0.4.74/core.specs.alpha-0.4.74.jar
+      - name: Fuzz end-to-end
+        env:
+          CLOJURE_CP: /tmp/clj-cp/clojure-1.12.0.jar:/tmp/clj-cp/spec.alpha-0.5.238.jar:/tmp/clj-cp/core.specs.alpha-0.4.74.jar
+        run: ./target/release/clojure-yarpgen fuzz -s 1 --count 4 -o out/ci-fuzz

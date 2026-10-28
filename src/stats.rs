@@ -93,6 +93,13 @@ fn walk_stmt(s: &Stmt, counts: &mut BTreeMap<String, i64>, depth: i64) {
                 walk_stmt(b, counts, depth + 1);
             }
         }
+        Stmt::Dotimes { body, .. } => {
+            bump(counts, "loops");
+            bump(counts, "dotimes");
+            for b in body {
+                walk_stmt(b, counts, depth + 1);
+            }
+        }
     }
 }
 
@@ -109,6 +116,7 @@ pub fn stmt_cost(s: &Stmt) -> u64 {
                 + els.iter().map(stmt_cost).sum::<u64>()
         }
         Stmt::Loop { body, .. } => 8 + body.iter().map(stmt_cost).sum::<u64>(),
+        Stmt::Dotimes { body, .. } => 8 + body.iter().map(stmt_cost).sum::<u64>(),
     }
 }
 

@@ -67,6 +67,8 @@ pub struct Options {
     pub dg_headers: bool,
     pub negative: NegativeKind,
     pub count: i64,
+    pub max_fn_cost: u64,
+    pub top_stmts: i64,
 }
 
 impl Default for Options {
@@ -89,6 +91,8 @@ impl Default for Options {
             dg_headers: false,
             negative: NegativeKind::None,
             count: 1,
+            max_fn_cost: 0,
+            top_stmts: 0,
         }
     }
 }
@@ -128,7 +132,10 @@ pub fn usage() -> &'static str {
      \x20 --dg-headers true|false emit DejaGNU dg directives (default false)\n\
      \x20 --negative none|arity|recur|nesting|hints|all\n\
      \x20                         negative (must-fail) suite (default none)\n\
-     \x20 --count N               programs to generate (default 1)\n"
+     \x20 --count N               programs to generate (default 1)\n\
+     \x20 --max-fn-cost N         cost units per function, 0 = default 60\n\
+     \x20                         (raise toward the 64KB ceiling deliberately)\n\
+     \x20 --top-stmts N           top-level statements, 0 = policy roll 2-5\n"
 }
 
 fn parse_density(s: &str) -> Option<Density> {
@@ -150,6 +157,10 @@ fn set_option(opts: &mut Options, key: &str, val: &str, errors: &mut Vec<String>
             Ok(n) => opts.mutation_seed = n,
             Err(_) => errors.push(format!("invalid integer '{val}' for --mutation-seed")),
         },
+        "max-fn-cost" => match val.parse::<u64>() {
+            Ok(n) => opts.max_fn_cost = n,
+            Err(_) => errors.push(format!("invalid integer '{val}' for --max-fn-cost")),
+        },
         "max-array-dims" => match val.parse::<i64>() {
             Ok(n) => opts.max_array_dims = n,
             Err(_) => errors.push(format!("invalid integer '{val}' for --max-array-dims")),
@@ -161,6 +172,10 @@ fn set_option(opts: &mut Options, key: &str, val: &str, errors: &mut Vec<String>
         "count" => match val.parse::<i64>() {
             Ok(n) => opts.count = n,
             Err(_) => errors.push(format!("invalid integer '{val}' for --count")),
+        },
+        "top-stmts" => match val.parse::<i64>() {
+            Ok(n) => opts.top_stmts = n,
+            Err(_) => errors.push(format!("invalid integer '{val}' for --top-stmts")),
         },
         "out-dir" => opts.out_dir = val.to_string(),
         "std" => match val {

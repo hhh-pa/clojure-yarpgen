@@ -4,7 +4,7 @@
 //! `ArithmeticExpr::create` + propagateType/evaluate/rebuild.
 
 use crate::cli::Density;
-use crate::context::GenCtx;
+use crate::context::{GenCtx, VarId};
 use crate::policy::{NodeKind, Policy};
 use crate::rng::Rng;
 use crate::sexp::Sexp;
@@ -17,6 +17,7 @@ const MAX_REBUILD_ATTEMPTS: i32 = 8;
 pub enum Expr {
     Const(Ir),
     Var {
+        id: VarId,
         name: String,
         ir: Ir,
     },
@@ -101,23 +102,29 @@ fn leaf(
     const_only: bool,
 ) -> Expr {
     let const_only = const_only || rng.roll(policy.const_use_prob);
-    let vars: Vec<&crate::context::Var> = genctx
+    let vars: Vec<VarId> = genctx
         .all_vars()
         .into_iter()
-        .filter(|v| {
+        .filter(|id| {
+            let typ = genctx.var_type(*id);
             if want_bool {
-                v.typ == CType::Bool
+                typ == CType::Bool
             } else {
-                v.typ.is_scalar()
+                typ.is_scalar()
             }
         })
         .collect();
     let use_var = !const_only && !vars.is_empty() && rng.roll(policy.reuse_prob);
     if use_var {
-        let v = rng.pick(&vars);
+        let id = *rng.pick(&vars);
         Expr::Var {
-            name: v.name.clone(),
-            ir: Ir::new(v.typ, v.value.clone(), ExKind::NoEx),
+            id,
+            name: genctx.var_name(id).to_string(),
+            ir: Ir::new(
+                genctx.var_type(id),
+                genctx.var_value(id).clone(),
+                ExKind::NoEx,
+            ),
         }
     } else {
         let typ = if want_bool {
@@ -148,7 +155,14 @@ fn gen_unary(
     depth: i64,
     pool: &Option<Vec<BinOp>>,
 ) -> Expr {
-    let op = [UnOp::Neg, UnOp::BNot, UnOp::Neg][rng.gen_usize(3)];
+    let op = [
+        UnOp::Neg,
+        UnOp::Neg,
+        UnOp::BNot,
+        UnOp::Inc,
+        UnOp::Dec,
+        UnOp::Abs,
+    ][rng.gen_usize(6)];
     let arg = generate(rng, policy, genctx, depth + 1, false, pool);
     let ir = types::eval_unop(op, arg.ir());
     Expr::UnOp {
@@ -199,18 +213,19 @@ fn gen_binary(
 /// rebuilt with a floored `mod` wrap, or a default is added, when
 /// generation-time evaluation reports out-of-bounds.
 fn gen_nth(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr {
-    let vecs: Vec<&crate::context::Var> = genctx
+    let vecs: Vec<VarId> = genctx
         .all_vars()
         .into_iter()
-        .filter(|v| v.typ == CType::Vec)
+        .filter(|id| genctx.var_type(*id) == CType::Vec)
         .collect();
     if vecs.is_empty() {
         return generate(rng, policy, genctx, depth, false, &None);
     }
-    let v = rng.pick(&vecs);
+    let v = *rng.pick(&vecs);
     let coll = Expr::Var {
-        name: v.name.clone(),
-        ir: Ir::new(CType::Vec, v.value.clone(), ExKind::NoEx),
+        id: v,
+        name: genctx.var_name(v).to_string(),
+        ir: Ir::new(CType::Vec, genctx.var_value(v).clone(), ExKind::NoEx),
     };
     // The index subtree always executes, so a faulty raw index must be
     // replaced (a default would only mask it). Leaves are always clean.
@@ -218,7 +233,7 @@ fn gen_nth(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, depth: i64) -> Expr 
     if !idx.ir().is_ok() {
         idx = leaf(rng, policy, genctx, false, false);
     }
-    let items = match &v.value {
+    let items = match genctx.var_value(v) {
         Value::Vec(items) => items.clone(),
         _ => return Expr::Const(types::random_const(rng, policy, CType::Long)),
     };
@@ -316,7 +331,7 @@ fn rebuild_binop(op: BinOp, ex: ExKind) -> BinOp {
 
 fn rebuild_unop(op: UnOp, _ex: ExKind) -> UnOp {
     match op {
-        UnOp::Neg => UnOp::Pos,
+        UnOp::Neg | UnOp::Inc | UnOp::Dec => UnOp::Pos,
         other => other,
     }
 }
@@ -363,6 +378,10 @@ fn rebuild_node(rng: &mut Rng, policy: &Policy, node: Expr) -> Expr {
             let op = rebuild_unop(op, ir.ex);
             re_eval(Expr::UnOp { op, arg, ir })
         }
+        // Belt and braces: gen_nth builds clean tops by construction,
+        // so a faulty Nth only arrives via a faulty index, for which a
+        // default is sound exactly when the index is int-ranged (the
+        // common OOB case). Out-of-int-range indices cannot occur here.
         Expr::Nth { coll, idx, .. } => {
             let d = types::random_const(rng, policy, CType::Long);
             Expr::NthDefault {
@@ -387,12 +406,17 @@ pub fn generate_safe(
     exc_mode: Density,
 ) -> Expr {
     let pool = similar_op_pool(rng, policy);
+    // Roll the dead-code allowance once per expression: rolling per
+    // attempt would make persistently faulty positions near-certain
+    // to be allowed under Density::Some.
+    let mut allowed: Option<bool> = None;
     let mut node = generate(rng, policy, genctx, 0, want_bool, &pool);
     for _ in 0..MAX_REBUILD_ATTEMPTS {
         if node.ir().is_ok() {
             return node;
         }
-        if allow_exc(rng, policy, genctx.taken, exc_mode) {
+        let allow = *allowed.get_or_insert_with(|| allow_exc(rng, policy, genctx.taken, exc_mode));
+        if allow {
             return node;
         }
         node = rebuild_node(rng, policy, node);
@@ -427,6 +451,9 @@ pub fn to_sexp(node: &Expr, atoms: &std::collections::BTreeSet<String>) -> Sexp 
             let s = match op {
                 UnOp::Neg => "-",
                 UnOp::BNot => "bit-not",
+                UnOp::Inc => "inc",
+                UnOp::Dec => "dec",
+                UnOp::Abs => "abs",
                 UnOp::Pos => "+",
             };
             Sexp::list(vec![Sexp::sym(s), to_sexp(arg, atoms)])
@@ -557,12 +584,15 @@ mod tests {
     fn emission_derefs_atoms() {
         use std::collections::BTreeSet;
         let atoms: BTreeSet<String> = ["out-0".to_string()].into_iter().collect();
+        let ctx = ctx_with_vars();
         let e = Expr::Var {
+            id: ctx.id_of("out-0").unwrap(),
             name: "out-0".to_string(),
             ir: Ir::long(1),
         };
         assert_eq!(to_sexp(&e, &atoms).flat(), "(deref out-0)");
         let f = Expr::Var {
+            id: ctx.id_of("in-0").unwrap(),
             name: "in-0".to_string(),
             ir: Ir::long(1),
         };

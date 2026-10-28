@@ -21,14 +21,21 @@ fn mutate_stmt(
     s: &Stmt,
 ) -> (GenCtx, Stmt) {
     match s {
-        Stmt::Assign { target, .. } => {
+        Stmt::Assign {
+            target, target_id, ..
+        } => {
+            // Output ids are stable: generation and mutation seed the
+            // context with inputs then outputs in the same order, and
+            // assignment targets are always outputs.
+            debug_assert_eq!(genctx.id_of(target), Some(*target_id));
             let rhs = expr::generate_safe(rng, policy, genctx, false, exc_mode);
             let mut next = genctx.clone();
-            next.update_value(target, rhs.ir().value.clone());
+            next.update_value_by_id(*target_id, rhs.ir().value.clone());
             (
                 next,
                 Stmt::Assign {
                     target: target.clone(),
+                    target_id: *target_id,
                     expr: rhs,
                 },
             )
@@ -54,8 +61,7 @@ fn mutate_stmt(
         } => {
             let (next, body) = mutate_scope(rng, policy, genctx, exc_mode, mode, body);
             let (start, end, step) = if mode == MutateMode::All {
-                let (s, e, st) = policy::loop_bounds(rng, policy);
-                (s, e, st)
+                policy::loop_bounds(rng, policy)
             } else {
                 (*start, *end, *step)
             };
@@ -66,6 +72,22 @@ fn mutate_stmt(
                     start,
                     end,
                     step,
+                    body,
+                },
+            )
+        }
+        Stmt::Dotimes { var, end, body } => {
+            let (next, body) = mutate_scope(rng, policy, genctx, exc_mode, mode, body);
+            let end = if mode == MutateMode::All {
+                policy::loop_end(rng, policy)
+            } else {
+                *end
+            };
+            (
+                next,
+                Stmt::Dotimes {
+                    var: var.clone(),
+                    end,
                     body,
                 },
             )
@@ -168,7 +190,7 @@ pub fn mutate_program(
             init: o.init,
             final_value: final_ctx
                 .lookup(&o.name)
-                .map(|v| v.long_value())
+                .map(|v| v.as_long())
                 .unwrap_or(o.init),
         })
         .collect();
@@ -183,6 +205,7 @@ pub fn mutate_program(
         stmts,
         expected_hash: hash::checksum(&pairs),
         check_algo: program.check_algo,
+        mutation_seed: program.mutation_seed,
     }
 }
 
@@ -194,6 +217,11 @@ mod tests {
     use crate::types::{CType, Ir, Value};
 
     fn sample() -> Program {
+        // Mirror seed_context order (inputs then outputs) so the
+        // recorded id matches the mutation context's numbering.
+        let mut ctx = GenCtx::new();
+        ctx.add_input("in-0", CType::Long, Value::Long(1));
+        let oid = ctx.add_output("out-0", CType::Long, Value::Long(0));
         Program {
             seed: 9,
             inputs: vec![Input {
@@ -208,10 +236,12 @@ mod tests {
             }],
             stmts: vec![Stmt::Assign {
                 target: "out-0".to_string(),
+                target_id: oid,
                 expr: Expr::Const(Ir::long(2)),
             }],
             expected_hash: 0,
             check_algo: crate::cli::CheckAlgo::Hash,
+            mutation_seed: None,
         }
     }
 

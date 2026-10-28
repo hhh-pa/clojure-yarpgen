@@ -85,7 +85,7 @@ fn generate_program(seed: u64, options: &Options, policy: &Policy, rng: &mut Rng
     for o in outputs.iter_mut() {
         o.final_value = final_ctx
             .lookup(&o.name)
-            .map(|v| v.long_value())
+            .map(|v| v.as_long())
             .unwrap_or(o.init);
     }
     let pairs: Vec<(String, i64)> = outputs
@@ -99,6 +99,7 @@ fn generate_program(seed: u64, options: &Options, policy: &Policy, rng: &mut Rng
         stmts,
         expected_hash: hash::checksum(&pairs),
         check_algo: options.check_algo,
+        mutation_seed: None,
     };
     if options.mutate != MutateMode::None {
         let mut_seed = if options.mutation_seed == 0 {
@@ -114,8 +115,22 @@ fn generate_program(seed: u64, options: &Options, policy: &Policy, rng: &mut Rng
             options.allow_exc_in_dead,
             options.mutate,
         );
+        program.mutation_seed = Some(mut_seed);
     }
     program
+}
+
+/// Generate one program and emit it to `dir`. Returns the program
+/// so callers can report on it.
+fn generate_to_dir(options: &Options, seed: u64, dir: &std::path::Path) -> Option<Program> {
+    let mut rng = Rng::new(seed);
+    let policy = policy::make_policy(options, &mut rng);
+    let program = generate_program(seed, options, &policy, &mut rng);
+    if let Err(e) = emitter::emit_test(dir, &program, options, &mut rng) {
+        eprintln!("error: failed to emit test: {e}");
+        return None;
+    }
+    Some(program)
 }
 
 fn run_generate(options: &Options) -> ExitCode {
@@ -142,28 +157,88 @@ fn run_generate(options: &Options) -> ExitCode {
         let count = options.count.max(1);
         for i in 0..count {
             let seed = base_seed.wrapping_add(i as u64);
-            let mut rng = Rng::new(seed);
-            let policy = policy::make_policy(options, &mut rng);
-            let program = generate_program(seed, options, &policy, &mut rng);
             let dir = if count == 1 {
                 PathBuf::from(&options.out_dir)
             } else {
                 PathBuf::from(&options.out_dir).join(format!("seed-{seed}"))
             };
-            if let Err(e) = emitter::emit_test(&dir, &program, options, &mut rng) {
-                eprintln!("error: failed to emit test: {e}");
-                return ExitCode::FAILURE;
-            }
+            let program = match generate_to_dir(options, seed, &dir) {
+                Some(p) => p,
+                None => return ExitCode::FAILURE,
+            };
             let st = stats::program_stats(&program);
-            println!(
+            let mut line = format!(
                 "seed={seed} dir={} hash={} stmts={} exprs={}",
                 dir.display(),
                 program.expected_hash,
                 st.get("stmts").unwrap_or(&0),
                 st.get("exprs").unwrap_or(&0)
             );
+            if let Some(m) = program.mutation_seed {
+                line.push_str(&format!(" mut-seed={m}"));
+            }
+            println!("{line}");
         }
         ExitCode::SUCCESS
+    }
+}
+
+/// Unattended fuzz loop: generate `--count` programs from `-s` into
+/// per-seed subdirs and verify each across all backends.
+fn run_fuzz(args: &[String]) -> ExitCode {
+    let parsed = cli::parse_args(args);
+    if !parsed.errors.is_empty() {
+        for e in &parsed.errors {
+            eprintln!("error: {e}");
+        }
+        return ExitCode::from(2);
+    }
+    let options = parsed.options;
+    if options.negative != NegativeKind::None {
+        eprintln!("error: fuzz does not support --negative (different oracle)");
+        return ExitCode::from(2);
+    }
+    let classpath = match runner::find_clojure_classpath() {
+        Some(cp) => cp,
+        None => {
+            eprintln!("error: no Clojure jar found; set CLOJURE_JAR to a clojure.jar path");
+            return ExitCode::FAILURE;
+        }
+    };
+    let base_seed = Rng::new(options.seed).seed();
+    println!("fuzz base-seed={base_seed} dir={}", options.out_dir);
+    let count = options.count.max(1);
+    let mut passed = 0;
+    let mut failed: Vec<u64> = Vec::new();
+    for i in 0..count {
+        let seed = base_seed.wrapping_add(i as u64);
+        let dir = PathBuf::from(&options.out_dir).join(format!("seed-{seed}"));
+        if generate_to_dir(&options, seed, &dir).is_none() {
+            failed.push(seed);
+            continue;
+        }
+        match runner::verify(&dir, &classpath, std::time::Duration::from_secs(120), None) {
+            Some(verdict) => {
+                if verdict.pass {
+                    passed += 1;
+                    println!("[{seed}] PASS hash={}", verdict.expected);
+                } else {
+                    failed.push(seed);
+                    println!("[{seed}] FAIL dir={}", dir.display());
+                    runner::report(&verdict);
+                }
+            }
+            None => {
+                failed.push(seed);
+                println!("[{seed}] ERROR dir={} (no expected.edn)", dir.display());
+            }
+        }
+    }
+    println!("fuzz: {passed} pass {} fail of {count}", failed.len());
+    if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -209,10 +284,15 @@ fn main() -> ExitCode {
     if args.first().map(|s| s.as_str()) == Some("verify") {
         return run_verify(&args[1..]);
     }
+    if args.first().map(|s| s.as_str()) == Some("fuzz") {
+        return run_fuzz(&args[1..]);
+    }
     let parsed = cli::parse_args(&args);
     if parsed.help {
         print!("{}", cli::usage());
-        println!("Commands:\n  verify DIR [backend...]  run a generated test across backends");
+        println!(
+            "Commands:\n  verify DIR [backend...]  run a generated test across backends\n  fuzz [options]           generate --count tests and verify each"
+        );
         return ExitCode::SUCCESS;
     }
     if parsed.version {

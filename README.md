@@ -17,6 +17,8 @@ generated programs need only Clojure on the JVM to run.
 cargo build --release
 ./target/release/clojure-yarpgen -s 42 -o out/smoke
 ./target/release/clojure-yarpgen verify out/smoke
+# Or unattended: generate and verify 50 tests across all backends.
+./target/release/clojure-yarpgen fuzz -s 1 --count 50 -o out/fuzz
 ```
 
 `verify` runs the test on every backend (default JIT and C1-only) and
@@ -42,11 +44,13 @@ Each test directory holds four files, mirroring YARPGen's layout:
 | `driver.clj`   | runs `test-fn`, prints `<hash> <seed>` (or asserts values)   |
 | `expected.edn` | `{:seed … :expected-hash … :check-algo …}` manifest           |
 
-`test-fn` is loop nests (`doseq` over `range`), `if`/`when`
-branches, and atom assignments over integer arithmetic, bit
-operations, comparisons, `min`/`max`, and vector `nth`. Top-level
-statements are chunked into sequential `test-fn-N` functions so no
-single method nears the 64KB JVM limit. Example fragment:
+`test-fn` is loop nests (`doseq` over `range` plus `dotimes`),
+`if`/`when` branches, and atom assignments over integer arithmetic
+(`+ - * quot rem inc dec abs`), bit operations, comparisons,
+`min`/`max`, and vector `nth`. Top-level statements are chunked into
+sequential `test-fn-N` functions so no single method nears the 64KB
+JVM limit (`--top-stmts` scales program size, `--max-fn-cost` the
+per-function budget). Example fragment:
 
 ```clojure
 (reset! out-1 (min (deref out-1) (nth vec-1 (mod (bit-not 60) 7))))
@@ -76,7 +80,11 @@ generation time:
   branches are still populated.
 - **JVM-exact semantics.** The model matches probed Clojure/JVM
   behavior: `0` is truthy, shifts mask to 6 bits, `rem`/`quot`
-  truncate, `nth` narrows checked via `toIntExact` in both arities.
+  truncate, `nth` narrows checked via `toIntExact` in both arities,
+  `rem` of `MIN/-1` is `0`, and — the sharpest edge found so far —
+  non-folded `(- x Long/MIN_VALUE)` always throws via an intermediate
+  `negateExact`, even when the result fits, so any `MIN` subtrahend
+  rebuilds. Checked `+ - * inc dec` throw on overflow (no promotion).
 
 ### Default policy limits
 
@@ -107,9 +115,11 @@ selects a flat, analyzer-friendly profile.
   expected value and prints `TORTURE-PASS` or `ERROR: value mismatch`.
 
 The backend matrix is `{default JIT, C1-only
-(-XX:TieredStopAtLevel=1)}`: disagreement between JIT tiers signals a
-JIT bug in the generated shape. `verify DIR [backend...]` selects a
-subset.
+(-XX:TieredStopAtLevel=1), direct-link
+(-Dclojure.compiler.direct-linking=true)}`: disagreement between
+backends signals a miscompilation of the generated shape.
+`verify DIR [backend...]` selects a subset; `fuzz` runs every
+backend for every seed.
 
 ## CLI reference
 
@@ -131,7 +141,10 @@ subset.
 --dg-headers true|false DejaGNU dg directives for torture-suite interop
 --negative none|arity|recur|nesting|hints|all  negative suite (default none)
 --count N               programs to generate as seed-N subdirs (default 1)
+--max-fn-cost N         cost units per function, 0 = default 60
+--top-stmts N           top-level statements, 0 = policy roll 2-5
 verify DIR [backend...] run a generated test across backends
+fuzz [options]          generate --count tests and verify each
 ```
 
 `--unchecked-math on` is a generator self-check: emitted programs
@@ -160,9 +173,12 @@ Every artifact records its seed:
 ./target/release/clojure-yarpgen verify out/repro
 ```
 
-Same seed + same flags = byte-identical output. Bisect by re-running
-with `--param-shuffle=false`, `--simple-loops=all`, or a targeted
-`--mutate` seed.
+Same seed + same flags = byte-identical output (generation runs at
+hundreds of programs per second; JVM runs dominate fuzz time).
+Mutations print their effective seed (`mut-seed=N`) and record it in
+the file header, so `--mutation-seed 0` stays reproducible. Bisect by
+re-running with `--param-shuffle=false`, `--simple-loops=all`, or a
+targeted `--mutate` seed.
 
 ## Guarantees and known limits
 

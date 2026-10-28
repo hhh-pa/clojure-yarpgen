@@ -5,7 +5,7 @@
 //! known exactly (enables a precomputed expected hash).
 
 use crate::cli::Density;
-use crate::context::GenCtx;
+use crate::context::{GenCtx, VarId};
 use crate::expr::{self, Expr};
 use crate::policy::{self, AssignKind, Policy, StructKind};
 use crate::rng::Rng;
@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 pub enum Stmt {
     Assign {
         target: String,
+        target_id: VarId,
         expr: Expr,
     },
     If {
@@ -32,16 +33,24 @@ pub enum Stmt {
         step: i64,
         body: Vec<Stmt>,
     },
+    /// `(dotimes [var end] ...)`: identical trips to a unit-step loop
+    /// from 0, but a different macroexpansion path through the compiler.
+    Dotimes {
+        var: String,
+        end: i64,
+        body: Vec<Stmt>,
+    },
 }
 
 /// Evaluate an expression against current context bindings.
 fn live_value(genctx: &GenCtx, node: &Expr) -> Ir {
     match node {
         Expr::Const(ir) => ir.clone(),
-        Expr::Var { name, .. } => match genctx.lookup(name) {
-            Some(v) => Ir::new(v.typ, v.value, crate::types::ExKind::NoEx),
-            None => Ir::new(CType::Long, Value::Long(0), crate::types::ExKind::Uninit),
-        },
+        Expr::Var { id, .. } => Ir::new(
+            genctx.var_type(*id),
+            genctx.var_value(*id).clone(),
+            crate::types::ExKind::NoEx,
+        ),
         Expr::UnOp { op, arg, .. } => types::eval_unop(*op, &live_value(genctx, arg)),
         Expr::BinOp {
             op, left, right, ..
@@ -120,13 +129,15 @@ fn try_simulate_stmt(
     strict: bool,
 ) -> Result<(), SimErr> {
     match stmt {
-        Stmt::Assign { target, expr } => {
+        Stmt::Assign {
+            target_id, expr, ..
+        } => {
             *budget = budget.checked_sub(1).ok_or(SimErr::Budget)?;
             let v = live_value(genctx, expr);
             if strict && !v.is_ok() {
                 return Err(SimErr::Fault);
             }
-            genctx.update_value(target, v.value);
+            genctx.update_value_by_id(*target_id, v.value);
             genctx.stmt_count += 1;
             Ok(())
         }
@@ -146,12 +157,27 @@ fn try_simulate_stmt(
             step,
             body,
         } => {
+            // Truncation mirrors population exactly: without it, stale
+            // loop variables would shift later ids out of alignment.
+            let snap = genctx.snapshot_len();
             let mut i = *start;
             while i < *end {
                 genctx.add_local(var, CType::Long, Value::Long(i));
                 try_simulate_stmts(genctx, body, budget, strict)?;
                 i += *step;
             }
+            genctx.truncate_to(snap);
+            Ok(())
+        }
+        Stmt::Dotimes { var, end, body } => {
+            let snap = genctx.snapshot_len();
+            let mut i = 0;
+            while i < *end {
+                genctx.add_local(var, CType::Long, Value::Long(i));
+                try_simulate_stmts(genctx, body, budget, strict)?;
+                i += 1;
+            }
+            genctx.truncate_to(snap);
             Ok(())
         }
     }
@@ -192,11 +218,11 @@ pub fn simulate_bounded_whole(genctx: &mut GenCtx, stmts: &[Stmt]) -> Result<(),
     try_simulate_stmts(genctx, stmts, &mut budget, true)
 }
 
-/// Halve every loop bound in a statement tree (minimum trip count 2).
+/// Halve every loop bound in a statement tree (minimum end bound 2).
 /// Returns false when nothing was shrinkable.
 pub fn shrink_loop_bounds(stmt: &mut Stmt) -> bool {
     match stmt {
-        Stmt::Loop { end, body, .. } => {
+        Stmt::Loop { end, body, .. } | Stmt::Dotimes { end, body, .. } => {
             let mut shrunk = false;
             if *end > 2 {
                 *end = (*end / 2).max(2);
@@ -235,8 +261,7 @@ fn simulate_loop_or_shrink(pre_ctx: &GenCtx, stmt: &mut Stmt, creation_count: i6
         match simulate_bounded(&mut ctx, std::slice::from_ref(stmt)) {
             Ok(()) => {
                 ctx.stmt_count = creation_count;
-                ctx.loop_depth = pre_ctx.loop_depth;
-                ctx.locals = pre_ctx.locals.clone();
+                ctx.restore_scope_from(pre_ctx);
                 return LoopSim::Ok(ctx);
             }
             Err(SimErr::Budget) => {
@@ -256,10 +281,11 @@ fn gen_assign(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, exc_mode: Density
     if writable.is_empty() {
         return None;
     }
-    let entry = rng.pick(&writable);
-    let target = entry.name.clone();
+    let target_id = *rng.pick(&writable);
+    let target = genctx.var_name(target_id).to_string();
+    let typ = genctx.var_type(target_id);
     let kind: AssignKind = rng.pick_weighted(&policy.assign_distr);
-    if kind == AssignKind::Reduction && entry.typ != CType::Vec {
+    if kind == AssignKind::Reduction && typ != CType::Vec {
         let op = *rng.pick(&[
             BinOp::Add,
             BinOp::Sub,
@@ -272,13 +298,19 @@ fn gen_assign(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, exc_mode: Density
         ]);
         let rhs = expr::generate_safe(rng, policy, genctx, false, exc_mode);
         let self_expr = Expr::Var {
+            id: target_id,
             name: target.clone(),
-            ir: Ir::new(entry.typ, entry.value.clone(), crate::types::ExKind::NoEx),
+            ir: Ir::new(
+                typ,
+                genctx.var_value(target_id).clone(),
+                crate::types::ExKind::NoEx,
+            ),
         };
         let ir = types::eval_binop(op, self_expr.ir(), rhs.ir());
         if ir.is_ok() {
             return Some(Stmt::Assign {
                 target,
+                target_id,
                 expr: Expr::BinOp {
                     op,
                     left: Box::new(self_expr),
@@ -287,10 +319,15 @@ fn gen_assign(rng: &mut Rng, policy: &Policy, genctx: &GenCtx, exc_mode: Density
                 },
             });
         }
-        return Some(Stmt::Assign { target, expr: rhs });
+        return Some(Stmt::Assign {
+            target,
+            target_id,
+            expr: rhs,
+        });
     }
     Some(Stmt::Assign {
         target,
+        target_id,
         expr: expr::generate_safe(rng, policy, genctx, false, exc_mode),
     })
 }
@@ -360,18 +397,33 @@ fn gen_loop(
     tag: &str,
 ) -> (GenCtx, Vec<Stmt>) {
     for _ in 0..4 {
-        let (start, end, step) = policy::loop_bounds(rng, policy);
+        // Half of all loops use dotimes: same trips as a unit-step
+        // doseq from 0, different macroexpansion stress.
+        let dotimes = rng.roll(0.5);
+        let (start, end, step) = if dotimes {
+            (
+                0,
+                policy::loop_end_at_depth(rng, policy, genctx.loop_depth),
+                1,
+            )
+        } else {
+            policy::loop_bounds_at_depth(rng, policy, genctx.loop_depth)
+        };
         let var = format!("i_{tag}_{}", genctx.loop_depth);
         let mut body_ctx = genctx.clone();
         body_ctx.add_local(&var, CType::Long, Value::Long(start));
         body_ctx.loop_depth += 1;
         let (after_body, body) = populate_scope(rng, policy, body_ctx, exc_mode, depth + 1);
-        let mut stmt = Stmt::Loop {
-            var,
-            start,
-            end,
-            step,
-            body,
+        let mut stmt = if dotimes {
+            Stmt::Dotimes { var, end, body }
+        } else {
+            Stmt::Loop {
+                var,
+                start,
+                end,
+                step,
+                body,
+            }
         };
         match simulate_loop_or_shrink(genctx, &mut stmt, after_body.stmt_count) {
             LoopSim::Ok(final_ctx) => return (final_ctx, vec![stmt]),
@@ -408,36 +460,40 @@ fn gen_loop_nest(
 
     impl NestBuilder<'_> {
         fn build(&mut self, genctx: &GenCtx, depth: i64, level: i64) -> (GenCtx, Stmt) {
-            let (start, end, step) = policy::loop_bounds(self.rng, self.policy);
+            let dotimes = self.rng.roll(0.5);
+            let (start, end, step) = if dotimes {
+                (
+                    0,
+                    policy::loop_end_at_depth(self.rng, self.policy, genctx.loop_depth),
+                    1,
+                )
+            } else {
+                policy::loop_bounds_at_depth(self.rng, self.policy, genctx.loop_depth)
+            };
             let var = format!("i_{}_nest{level}", self.tag);
             let mut body_ctx = genctx.clone();
             body_ctx.add_local(&var, CType::Long, Value::Long(start));
             body_ctx.loop_depth += 1;
-            if level == self.levels - 1 {
-                let (after, body) =
-                    populate_scope(self.rng, self.policy, body_ctx, self.exc_mode, depth + 1);
-                (
-                    after,
+            let wrap = |var: String, body: Vec<Stmt>| {
+                if dotimes {
+                    Stmt::Dotimes { var, end, body }
+                } else {
                     Stmt::Loop {
                         var,
                         start,
                         end,
                         step,
                         body,
-                    },
-                )
+                    }
+                }
+            };
+            if level == self.levels - 1 {
+                let (after, body) =
+                    populate_scope(self.rng, self.policy, body_ctx, self.exc_mode, depth + 1);
+                (after, wrap(var, body))
             } else {
                 let (after, inner) = self.build(&body_ctx, depth + 1, level + 1);
-                (
-                    after,
-                    Stmt::Loop {
-                        var,
-                        start,
-                        end,
-                        step,
-                        body: vec![inner],
-                    },
-                )
+                (after, wrap(var, vec![inner]))
             }
         }
     }
@@ -518,7 +574,7 @@ pub fn populate_scope(
     exc_mode: Density,
     depth: i64,
 ) -> (GenCtx, Vec<Stmt>) {
-    let n = policy::scope_size(rng, policy);
+    let n = policy::scope_size(rng, policy, depth);
     let mut ctx = genctx;
     let mut stmts = Vec::new();
     let mut k = 0;
@@ -536,11 +592,17 @@ pub fn populate_scope(
 /// atoms; loop variables and inputs are plain values.
 pub fn to_sexp(stmt: &Stmt, atoms: &BTreeSet<String>) -> Sexp {
     match stmt {
-        Stmt::Assign { target, expr } => Sexp::list(vec![
-            Sexp::sym("reset!"),
-            Sexp::sym(target),
-            expr::to_sexp(expr, atoms),
-        ]),
+        Stmt::Assign { target, expr, .. } => {
+            debug_assert!(
+                atoms.contains(target),
+                "assignment target {target} is not an atom"
+            );
+            Sexp::list(vec![
+                Sexp::sym("reset!"),
+                Sexp::sym(target),
+                expr::to_sexp(expr, atoms),
+            ])
+        }
         Stmt::If { cond, then, els } => {
             let c = expr::to_sexp(cond, atoms);
             let mut t = vec![Sexp::sym("do")];
@@ -575,6 +637,17 @@ pub fn to_sexp(stmt: &Stmt, atoms: &BTreeSet<String>) -> Sexp {
             items.extend(body.iter().map(|s| to_sexp(s, atoms)));
             Sexp::list(items)
         }
+        // Deliberately unhinted: dotimes rebinds through its own
+        // expansion, so binding metadata has murkier semantics than
+        // the probed doseq case.
+        Stmt::Dotimes { var, end, body } => {
+            let mut items = vec![
+                Sexp::sym("dotimes"),
+                Sexp::vec(vec![Sexp::sym(var), Sexp::int(*end)]),
+            ];
+            items.extend(body.iter().map(|s| to_sexp(s, atoms)));
+            Sexp::list(items)
+        }
     }
 }
 
@@ -600,8 +673,8 @@ mod tests {
             let mut sim = seeded_ctx();
             simulate_stmts(&mut sim, &stmts);
             assert_eq!(
-                sim.lookup("out-0").unwrap().long_value(),
-                ctx.lookup("out-0").unwrap().long_value()
+                sim.lookup("out-0").unwrap().as_long(),
+                ctx.lookup("out-0").unwrap().as_long()
             );
         }
     }
@@ -614,7 +687,7 @@ mod tests {
                     collect_targets(then, out);
                     collect_targets(els, out);
                 }
-                Stmt::Loop { body, .. } => collect_targets(body, out),
+                Stmt::Loop { body, .. } | Stmt::Dotimes { body, .. } => collect_targets(body, out),
             }
         }
     }
@@ -631,8 +704,9 @@ mod tests {
             collect_targets(&stmts, &mut targets);
             assert!(!targets.is_empty(), "seed {seed}: no assignments");
             for t in &targets {
+                let id = ctx.id_of(t).expect("target interned");
                 assert!(
-                    ctx.ext_out.contains_key(t),
+                    ctx.writable_vars().contains(&id),
                     "seed {seed}: assignment to non-output {t}"
                 );
             }
@@ -661,17 +735,17 @@ mod tests {
         // (* out-0 out-0) from 2 overflows within 10 iterations; the
         // strict checker must report Fault, not silently wrap.
         let mut ctx = seeded_ctx();
-        ctx.update_value("out-0", Value::Long(2));
+        let oid = ctx.id_of("out-0").unwrap();
+        ctx.update_value_by_id(oid, Value::Long(2));
+        let var = || Expr::Var {
+            id: oid,
+            name: "out-0".to_string(),
+            ir: Ir::long(2),
+        };
         let square = Expr::BinOp {
             op: BinOp::Mul,
-            left: Box::new(Expr::Var {
-                name: "out-0".to_string(),
-                ir: Ir::long(2),
-            }),
-            right: Box::new(Expr::Var {
-                name: "out-0".to_string(),
-                ir: Ir::long(2),
-            }),
+            left: Box::new(var()),
+            right: Box::new(var()),
             ir: Ir::long(4),
         };
         let prog = vec![Stmt::Loop {
@@ -681,6 +755,7 @@ mod tests {
             step: 1,
             body: vec![Stmt::Assign {
                 target: "out-0".to_string(),
+                target_id: oid,
                 expr: square,
             }],
         }];
@@ -690,10 +765,12 @@ mod tests {
     #[test]
     fn strict_simulation_catches_division_by_zero() {
         let mut ctx = seeded_ctx();
+        let oid = ctx.id_of("out-0").unwrap();
         let div = Expr::BinOp {
             op: BinOp::Div,
             left: Box::new(Expr::Const(Ir::long(1))),
             right: Box::new(Expr::Var {
+                id: oid,
                 name: "out-0".to_string(),
                 ir: Ir::long(0),
             }),
@@ -701,6 +778,7 @@ mod tests {
         };
         let prog = vec![Stmt::Assign {
             target: "out-0".to_string(),
+            target_id: oid,
             expr: div,
         }];
         assert_eq!(simulate_bounded(&mut ctx, &prog), Err(SimErr::Fault));
@@ -714,8 +792,11 @@ mod tests {
         let mut ctx = GenCtx::new();
         ctx.add_input("v", CType::Vec, Value::Vec(vec![1, 2, 3]));
         ctx.add_output("out-0", CType::Long, Value::Long(0));
+        let vid = ctx.id_of("v").unwrap();
+        let oid = ctx.id_of("out-0").unwrap();
         let nth = Expr::NthDefault {
             coll: Box::new(Expr::Var {
+                id: vid,
                 name: "v".to_string(),
                 ir: Ir::new(
                     CType::Vec,
@@ -729,6 +810,7 @@ mod tests {
         };
         let prog = vec![Stmt::Assign {
             target: "out-0".to_string(),
+            target_id: oid,
             expr: nth,
         }];
         assert_eq!(simulate_bounded(&mut ctx, &prog), Err(SimErr::Fault));
@@ -737,6 +819,8 @@ mod tests {
     #[test]
     fn loop_emission_shape() {
         let atoms: BTreeSet<String> = ["out-0".to_string()].into_iter().collect();
+        let mut ctx = GenCtx::new();
+        let oid = ctx.add_output("out-0", CType::Long, Value::Long(0));
         let s = Stmt::Loop {
             var: "i".to_string(),
             start: 0,
@@ -744,6 +828,7 @@ mod tests {
             step: 1,
             body: vec![Stmt::Assign {
                 target: "out-0".to_string(),
+                target_id: oid,
                 expr: Expr::Const(Ir::long(1)),
             }],
         };
@@ -751,5 +836,77 @@ mod tests {
             to_sexp(&s, &atoms).flat(),
             "(doseq [i (range 0 10 1)] (reset! out-0 1))"
         );
+    }
+
+    #[test]
+    fn dotimes_emission_shape() {
+        let atoms: BTreeSet<String> = ["out-0".to_string()].into_iter().collect();
+        let mut ctx = GenCtx::new();
+        let oid = ctx.add_output("out-0", CType::Long, Value::Long(0));
+        let iid = ctx.add_local("i", CType::Long, Value::Long(0));
+        let s = Stmt::Dotimes {
+            var: "i".to_string(),
+            end: 10,
+            body: vec![Stmt::Assign {
+                target: "out-0".to_string(),
+                target_id: oid,
+                expr: Expr::Var {
+                    id: iid,
+                    name: "i".to_string(),
+                    ir: Ir::long(0),
+                },
+            }],
+        };
+        assert_eq!(
+            to_sexp(&s, &atoms).flat(),
+            "(dotimes [i 10] (reset! out-0 i))"
+        );
+    }
+
+    #[test]
+    fn dotimes_matches_unit_loop_trips() {
+        // Pre-intern the loop variable: simulation upserts the same id
+        // on loop entry, so hand-built references stay aligned.
+        let mut base = seeded_ctx();
+        base.add_local("i", CType::Long, Value::Long(0));
+        let oid = base.id_of("out-0").unwrap();
+        let iid = base.id_of("i").unwrap();
+        let body = vec![Stmt::Assign {
+            target: "out-0".to_string(),
+            target_id: oid,
+            expr: Expr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(Expr::Var {
+                    id: oid,
+                    name: "out-0".to_string(),
+                    ir: Ir::long(0),
+                }),
+                right: Box::new(Expr::Var {
+                    id: iid,
+                    name: "i".to_string(),
+                    ir: Ir::long(0),
+                }),
+                ir: Ir::long(0),
+            },
+        }];
+        let doseq = Stmt::Loop {
+            var: "i".to_string(),
+            start: 0,
+            end: 7,
+            step: 1,
+            body: body.clone(),
+        };
+        let dotimes = Stmt::Dotimes {
+            var: "i".to_string(),
+            end: 7,
+            body,
+        };
+        let mut a = base.clone();
+        simulate_stmts(&mut a, &[doseq]);
+        let mut b = base;
+        simulate_stmts(&mut b, &[dotimes]);
+        // 0+1+2+3+4+5+6
+        assert_eq!(a.lookup("out-0").unwrap().as_long(), 21);
+        assert_eq!(b.lookup("out-0").unwrap().as_long(), 21);
     }
 }

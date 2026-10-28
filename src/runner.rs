@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// One execution backend: default JIT (C2) vs C1-only. Disagreement
-/// between tiers signals a JIT miscompilation of the generated program.
+/// One execution backend. Disagreement between backends signals a
+/// miscompilation of the generated program: default JIT (C2) vs
+/// C1-only vs direct-linked calls.
 #[derive(Clone, Debug)]
 pub struct Backend {
     pub name: &'static str,
@@ -27,6 +28,10 @@ pub fn backends() -> Vec<Backend> {
         Backend {
             name: "c1-only",
             jvm_opts: vec!["-XX:TieredStopAtLevel=1"],
+        },
+        Backend {
+            name: "direct-link",
+            jvm_opts: vec!["-Dclojure.compiler.direct-linking=true"],
         },
     ]
 }
@@ -111,6 +116,23 @@ pub fn run_test(dir: &Path, classpath: &str, backend: &Backend, timeout: Duratio
             };
         }
     };
+    // Drain both pipes on background threads from the start: a verbose
+    // compiler crash can otherwise fill a pipe buffer, block the child,
+    // and turn into a bogus 120s timeout.
+    let out_handle = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = out.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let err_handle = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            buf
+        })
+    });
     let deadline = Instant::now() + timeout;
     let exit = loop {
         match child.try_wait() {
@@ -125,14 +147,8 @@ pub fn run_test(dir: &Path, classpath: &str, backend: &Backend, timeout: Duratio
             Err(_) => break None,
         }
     };
-    let mut output = String::new();
-    let mut error = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut output);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut error);
-    }
+    let output = out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let error = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
     let (hash, seed) = parse_hash_line(&output);
     let torture_pass = output.lines().any(|l| l.trim() == "TORTURE-PASS");
     RunResult {

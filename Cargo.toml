@@ -1,0 +1,14 @@
+[package]
+name = "clojure-yarpgen"
+version = "0.1.0"
+edition = "2021"
+description = "Random Clojure program generator for compiler stress testing, in the spirit of Intel YARPGen"
+license = "Apache-2.0"
+repository = "https://github.com/hhh-pa/clojure-yarpgen"
+
+[[bin]]
+name = "clojure-yarpgen"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
